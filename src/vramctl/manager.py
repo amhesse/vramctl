@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 
 from vramctl.backends.base import BackendError
 from vramctl.backends.llamacpp import LlamaCppBackend
@@ -20,8 +21,42 @@ from vramctl.config import (
     PlacementConfig,
     load_config,
 )
-from vramctl.nvidia import LocalRunner, SshRunner, declared_gpus
+from vramctl.nvidia import LocalRunner, NvidiaError, SshRunner, declared_gpus, stop_pid
 from vramctl.probe import probe_local, probe_remote
+
+
+class _EndpointHealth:
+    """Backoff for an endpoint that stops answering.
+
+    A sleeping laptop would otherwise cost every refresh a full timeout on
+    each of its endpoints. After a failure the endpoint is left alone for a
+    growing interval instead of being retried on every tick.
+    """
+
+    BASE_DELAY = 5.0
+    MAX_DELAY = 60.0
+
+    def __init__(self) -> None:
+        self.failures = 0
+        self.next_attempt = 0.0
+        self.last_error = ""
+
+    def should_skip(self, now: float) -> bool:
+        return self.failures > 0 and now < self.next_attempt
+
+    def wait_remaining(self, now: float) -> int:
+        return max(0, round(self.next_attempt - now))
+
+    def record_failure(self, error: str) -> None:
+        self.failures += 1
+        delay = min(self.MAX_DELAY, self.BASE_DELAY * (2 ** (self.failures - 1)))
+        self.next_attempt = time.time() + delay
+        self.last_error = error
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.next_attempt = 0.0
+        self.last_error = ""
 
 
 class _Telemetry:
@@ -102,6 +137,12 @@ class ClusterManager:
         self.last_refresh = 0.0
 
         self._telemetry: dict[str, _Telemetry] = {}
+        self._health: dict[str, _EndpointHealth] = {}
+        # (node, gpu index) -> recent utilization samples, for the sparklines.
+        self.history: dict[tuple[str, int], deque[int]] = {}
+        # node -> the telemetry timestamp already folded into history, so a
+        # cached remote reading is not sampled twice.
+        self._sampled: dict[str, float] = {}
         # (node, backend key) -> backend instance
         self.ollama: list[OllamaBackend] = []
         self.llamacpp: dict[str, LlamaCppBackend] = {}
@@ -143,14 +184,25 @@ class ClusterManager:
 
         by_node = {n.name: n for n in state.nodes}
 
+        now = time.time()
         for backend in self.ollama:
             if not backend.is_enabled():
+                continue
+            key = f"ollama:{backend.node}:{backend.label}"
+            health = self._health.setdefault(key, _EndpointHealth())
+            if health.should_skip(now):
+                state.errors.append(
+                    f"{backend.node}/{backend.label} unreachable, retrying in "
+                    f"{health.wait_remaining(now)}s"
+                )
                 continue
             node_state = by_node.get(backend.node)
             gpus = node_state.gpus if node_state else []
             try:
                 state.models.extend(backend.list_running(gpus))
+                health.record_success()
             except BackendError as exc:
+                health.record_failure(str(exc))
                 state.errors.append(str(exc))
 
         seen_pids: set[tuple[str, int]] = set()
@@ -161,9 +213,17 @@ class ClusterManager:
             for node_name, backend in process_backends.items():
                 node_state = by_node.get(node_name)
                 gpus = node_state.gpus if node_state else []
+                key = f"{name}:{node_name}"
+                health = self._health.setdefault(key, _EndpointHealth())
+                if health.should_skip(now):
+                    continue
                 try:
-                    found = backend.list_running(gpus, node_state.procs if node_state else None)
+                    found = backend.list_running(
+                        gpus, node_state.procs if node_state else None
+                    )
+                    health.record_success()
                 except BackendError as exc:
+                    health.record_failure(str(exc))
                     state.errors.append(str(exc))
                     continue
                 for model in found:
@@ -176,11 +236,60 @@ class ClusterManager:
                     model.node = node_name
                     state.models.append(model)
 
+        self._sample_history(state)
         state.models.extend(self._other_consumers(state))
         state.models.sort(key=lambda m: (m.node, -m.vram_mb, m.backend, m.name))
         self.state = state
         self.last_refresh = time.time()
         return state
+
+    def _sample_history(self, state: ClusterState) -> None:
+        """Append one utilization sample per GPU, per fresh reading.
+
+        Remote readings are cached, so sampling on every tick would stretch a
+        single measurement across the whole sparkline.
+        """
+        for node_state in state.nodes:
+            telemetry = self._telemetry.get(node_state.name)
+            stamp = telemetry.fetched_at if telemetry else 0.0
+            if stamp and self._sampled.get(node_state.name) == stamp:
+                continue
+            self._sampled[node_state.name] = stamp
+            for gpu in node_state.gpus:
+                series = self.history.setdefault(
+                    gpu.key, deque(maxlen=self.config.history_samples)
+                )
+                series.append(gpu.utilization_pct)
+
+    def series_for(self, node: str, index: int) -> list[int]:
+        return list(self.history.get((node, index), ()))
+
+    def stop_process(self, model: LoadedModel) -> str:
+        """Stop the process behind a row, over SSH when it is not local.
+
+        Destructive, and possibly on another machine, so the caller is
+        responsible for confirming with the user first.
+        """
+
+        if not self.config.allow_process_kill:
+            raise BackendError(
+                "stopping processes is disabled (allow_process_kill is false)"
+            )
+        if model.pid is None:
+            raise BackendError(f"{model.name} has no pid to stop")
+
+        telemetry = self._telemetry.get(model.node)
+        if telemetry is None or telemetry.runner is None:
+            raise BackendError(f"no way to reach {model.node}")
+
+        try:
+            result = stop_pid(model.pid, telemetry.runner, timeout=10.0)
+        except NvidiaError as exc:
+            raise BackendError(str(exc)) from exc
+        # The card does not give the memory back instantly.
+        self._await_release(model, timeout=15.0)
+        self.refresh_state(force_telemetry=True)
+        return result
 
     def _other_consumers(self, state: ClusterState) -> list[LoadedModel]:
         """VRAM held by processes that are not models we manage.

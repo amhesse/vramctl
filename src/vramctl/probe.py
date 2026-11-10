@@ -20,12 +20,13 @@ from vramctl.config import (
 )
 from vramctl.nvidia import (
     _APP_FIELDS,
+    _GPU_FIELD_COUNT,
     _GPU_FIELDS,
     NVIDIA_SMI,
     NvidiaError,
     _rows,
-    _to_int,
     _to_mb,
+    build_gpu,
     query_gpus,
     query_system_ram,
 )
@@ -95,18 +96,10 @@ def probe_remote(runner, node: str, timeout: float) -> NodeProbe:
 def _parse_gpus(gpu_out: str, app_out: str, node: str) -> list[GPUInfo]:
     gpus: list[GPUInfo] = []
     by_uuid: dict[str, GPUInfo] = {}
-    for index, uuid, name, total, used, util in _rows(gpu_out, 6):
-        gpu = GPUInfo(
-            index=_to_int(index),
-            uuid=uuid,
-            name=name,
-            memory_total_mb=_to_mb(total),
-            memory_used_mb=_to_mb(used),
-            utilization_pct=_to_int(util),
-            node=node,
-        )
+    for cells in _rows(gpu_out, _GPU_FIELD_COUNT):
+        gpu = build_gpu(cells, node)
         gpus.append(gpu)
-        by_uuid[uuid] = gpu
+        by_uuid[gpu.uuid] = gpu
 
     # Compute apps are identified by UUID, not index, so join on that.
     for pid, used, uuid in _rows(app_out, 3):

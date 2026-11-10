@@ -22,6 +22,17 @@ An interactive terminal UI (TUI) for inspecting, loading, unloading, and splitti
    - **`u` (Unload)**: Immediately evict the selected model from VRAM/RAM.
    - **`r` (Refresh)**: Manually refresh GPU, RAM, and runtime state, forcing
      a re-read of remote machines rather than using the cached reading.
+   - **`k` (Stop process)**: Stop the process behind the selected row, over
+     SSH when it is on another machine. Always confirmed first, and the dialog
+     opens on Cancel. SIGTERM, then SIGKILL if that is ignored. This is a
+     separate key from `u` on purpose: `u` asks a backend to release a model,
+     while `k` ends a process. Set `allow_process_kill` to false to remove it.
+
+   Each card also carries a utilization sparkline and, where the card reports
+   them, temperature, power against its limit, and fan speed. A sensor the
+   card withholds is omitted rather than shown as zero. Samples are only
+   appended when a reading is actually fresh, so a cached remote reading does
+   not stretch across the whole sparkline.
 
    VRAM held by something that is not a managed model - a game, ComfyUI, a
    voice server - is listed as an `other` row against the card holding it, so
@@ -106,6 +117,11 @@ Notes on nodes:
   and the on-disk model catalogues are local too.
 - A remote probe is a single SSH invocation whose sections are split on a
   sentinel, so a refresh costs one round trip rather than four.
+- An endpoint that stops answering is backed off exponentially (5s, doubling
+  to a 60s cap) instead of being retried on every tick, so a sleeping laptop
+  costs one timeout rather than one per refresh. Inspection uses
+  `inspect_timeout` (3s) to stay responsive, while a load gets
+  `load_timeout` (600s) because pulling a large model into VRAM is slow.
 
 `VRAMCTL_OLLAMA_URL`, `VRAMCTL_STRATA_URL`, `VRAMCTL_LLAMA_SERVER`,
 `VRAMCTL_STRATA_BIN`, and `VRAMCTL_GGUF_DIRS` (`:`-separated) override the

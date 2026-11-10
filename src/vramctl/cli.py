@@ -103,6 +103,10 @@ def _print_once(manager: ClusterManager, as_json: bool) -> int:
                             "memory_total_mb": g.memory_total_mb,
                             "memory_used_mb": g.memory_used_mb,
                             "utilization_pct": g.utilization_pct,
+                            "temperature_c": g.temperature_c,
+                            "power_w": g.power_w,
+                            "power_limit_w": g.power_limit_w,
+                            "fan_pct": g.fan_pct,
                             "declared": g.declared,
                             "pids": g.pids,
                         }
@@ -149,10 +153,11 @@ def _print_once(manager: ClusterManager, as_json: bool) -> int:
                     f"{held:>6}/{gpu.memory_total_mb} MiB held/declared"
                 )
             else:
+                sensors = f"  {gpu.sensors}" if gpu.sensors else ""
                 print(
                     f"  GPU {gpu.index}  {gpu.short_name:<24} "
                     f"{gpu.memory_used_mb:>6}/{gpu.memory_total_mb} MiB  "
-                    f"{gpu.utilization_pct:>3}% util"
+                    f"{gpu.utilization_pct:>3}% util{sensors}"
                 )
         if node.ram:
             print(f"  RAM        {node.ram.used_mb:>6}/{node.ram.total_mb} MiB")

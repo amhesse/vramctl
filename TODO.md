@@ -37,9 +37,10 @@
       runner.
 - [ ] Optional: `vramctl split <model> --gpu N` as a non-interactive subcommand.
       Only the TUI `s` key does this today.
-- [ ] Per-endpoint failure backoff: when a host sleeps, each refresh still
-      waits out `request_timeout` on its Ollama endpoints.
-- [ ] nvtop-style extras: utilization history/sparklines, and temperature,
-      power and fan from the same `nvidia-smi` query.
-- [ ] Stopping a remote process (an `other` row, or a remote `llama-server`)
-      would need an SSH `kill`, which is deliberately not wired up.
+- [x] Per-endpoint failure backoff, plus separate inspect/load timeouts so
+      polling stays responsive while a slow load is not abandoned.
+- [x] nvtop-style extras: utilization sparklines, and temperature, power and
+      fan from the same `nvidia-smi` query, with unreported sensors omitted
+      rather than shown as zero.
+- [x] Stopping a process, including over SSH, behind the `k` key and a
+      confirmation dialog that opens on Cancel.

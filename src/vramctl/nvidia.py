@@ -12,7 +12,11 @@ from vramctl.config import MIB, GPUInfo, SystemRAM
 
 NVIDIA_SMI = "nvidia-smi"
 
-_GPU_FIELDS = "index,uuid,name,memory.total,memory.used,utilization.gpu"
+_GPU_FIELDS = (
+    "index,uuid,name,memory.total,memory.used,utilization.gpu,"
+    "temperature.gpu,power.draw,enforced.power.limit,fan.speed"
+)
+_GPU_FIELD_COUNT = 10
 _APP_FIELDS = "pid,used_gpu_memory,gpu_uuid"
 
 
@@ -127,6 +131,41 @@ def _to_int(value: str) -> int:
         return 0
 
 
+def _opt_int(value: str) -> int | None:
+    """``[N/A]`` and ``[Not Supported]`` mean unknown, not zero."""
+    token = value.replace("%", "").strip()
+    try:
+        return int(float(token))
+    except ValueError:
+        return None
+
+
+def _opt_float(value: str) -> float | None:
+    token = value.replace("W", "").strip()
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def build_gpu(cells: list[str], node: str = "") -> GPUInfo:
+    """One GPU row from the ``--query-gpu`` field list above."""
+    index, uuid, name, total, used, util, temp, power, limit, fan = cells
+    return GPUInfo(
+        index=_to_int(index),
+        uuid=uuid,
+        name=name,
+        memory_total_mb=_to_mb(total),
+        memory_used_mb=_to_mb(used),
+        utilization_pct=_to_int(util),
+        temperature_c=_opt_int(temp),
+        power_w=_opt_float(power),
+        power_limit_w=_opt_float(limit),
+        fan_pct=_opt_int(fan),
+        node=node,
+    )
+
+
 def query_gpus(timeout: float = 5.0, runner=None, node: str = "") -> list[GPUInfo]:
     """Return every visible GPU with its VRAM totals and per-PID allocations.
 
@@ -139,18 +178,10 @@ def query_gpus(timeout: float = 5.0, runner=None, node: str = "") -> list[GPUInf
     )
     gpus: list[GPUInfo] = []
     by_uuid: dict[str, GPUInfo] = {}
-    for index, uuid, name, total, used, util in _rows(gpu_out, 6):
-        gpu = GPUInfo(
-            index=_to_int(index),
-            uuid=uuid,
-            name=name,
-            memory_total_mb=_to_mb(total),
-            memory_used_mb=_to_mb(used),
-            utilization_pct=_to_int(util),
-            node=node,
-        )
+    for cells in _rows(gpu_out, _GPU_FIELD_COUNT):
+        gpu = build_gpu(cells, node)
         gpus.append(gpu)
-        by_uuid[uuid] = gpu
+        by_uuid[gpu.uuid] = gpu
 
     try:
         app_out = _run(
@@ -231,6 +262,78 @@ def gpu_pid_map(gpus: list[GPUInfo]) -> dict[int, dict[int, int]]:
         for pid, mb in gpu.pids.items():
             out.setdefault(pid, {})[gpu.index] = mb
     return out
+
+
+def stop_pid(pid: int, runner=None, timeout: float = 10.0) -> str:
+    """Stop a process, locally or on the machine ``runner`` points at.
+
+    SIGTERM first, then SIGKILL if it is still there, because VRAM is only
+    released when the process actually goes. Returns a short description of
+    what happened.
+
+    Callers must confirm with the user first: this is destructive and may be
+    on another machine.
+    """
+
+    if pid <= 1:
+        raise NvidiaError(f"refusing to signal pid {pid}")
+    if runner is None or not getattr(runner, "remote", False):
+        return _stop_pid_local(pid, timeout)
+
+    # `kill -0` probes without signalling, so the escalation can tell whether
+    # the process actually went rather than assuming.
+    script = (
+        f"kill -TERM {pid} 2>/dev/null || exit 3; "
+        f"for i in $(seq 1 {max(1, int(timeout))}); do "
+        f"kill -0 {pid} 2>/dev/null || {{ echo terminated; exit 0; }}; sleep 1; done; "
+        f"kill -KILL {pid} 2>/dev/null; sleep 1; "
+        f"kill -0 {pid} 2>/dev/null && echo survived || echo killed"
+    )
+    try:
+        out = runner.run(["sh", "-c", script], timeout + 10).strip()
+    except NvidiaError as exc:
+        if "exit 3" in str(exc) or "status 3" in str(exc):
+            raise NvidiaError(f"pid {pid} not found or not permitted") from exc
+        raise
+    if out == "terminated":
+        return f"pid {pid} terminated on {runner.name}"
+    if out == "killed":
+        return f"pid {pid} killed on {runner.name} after SIGTERM was ignored"
+    if out == "survived":
+        raise NvidiaError(f"pid {pid} on {runner.name} survived SIGKILL")
+    return f"pid {pid}: {out or 'no response'}"
+
+
+def _stop_pid_local(pid: int, timeout: float) -> str:
+    import os
+    import signal
+
+    if pid == os.getpid():
+        raise NvidiaError("refusing to signal vramctl itself")
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return f"pid {pid} was already gone"
+    except psutil.Error as exc:
+        raise NvidiaError(f"cannot signal pid {pid}: {exc}") from exc
+
+    try:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=timeout)
+        return f"pid {pid} terminated"
+    except psutil.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+            return f"pid {pid} killed after SIGTERM was ignored"
+        except psutil.NoSuchProcess:
+            return f"pid {pid} terminated"
+        except psutil.Error as exc:
+            raise NvidiaError(f"pid {pid} would not die: {exc}") from exc
+    except psutil.NoSuchProcess:
+        return f"pid {pid} terminated"
+    except (psutil.AccessDenied, PermissionError) as exc:
+        raise NvidiaError(f"not permitted to stop pid {pid}: {exc}") from exc
 
 
 def process_ram_mb(pid: int) -> int:

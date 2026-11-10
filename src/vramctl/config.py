@@ -102,6 +102,11 @@ class GPUInfo:
     memory_total_mb: int
     memory_used_mb: int
     utilization_pct: int = 0
+    # None means the card did not report it, which is not the same as zero.
+    temperature_c: int | None = None
+    power_w: float | None = None
+    power_limit_w: float | None = None
+    fan_pct: int | None = None
     # pid -> MiB that pid has allocated on *this* GPU
     pids: dict[int, int] = field(default_factory=dict)
     # Which machine this card is in, and whether the totals were measured by
@@ -122,6 +127,21 @@ class GPUInfo:
         if self.memory_total_mb <= 0:
             return 0.0
         return self.memory_used_mb / self.memory_total_mb
+
+    @property
+    def sensors(self) -> str:
+        """Temp, power and fan, omitting whatever the card withholds."""
+        bits = []
+        if self.temperature_c is not None:
+            bits.append(f"{self.temperature_c}\u00b0C")
+        if self.power_w is not None:
+            if self.power_limit_w:
+                bits.append(f"{self.power_w:.0f}/{self.power_limit_w:.0f}W")
+            else:
+                bits.append(f"{self.power_w:.0f}W")
+        if self.fan_pct is not None:
+            bits.append(f"fan {self.fan_pct}%")
+        return "  ".join(bits)
 
     @property
     def short_name(self) -> str:
@@ -379,6 +399,17 @@ class Config:
 
     refresh_seconds: float = 3.0
     request_timeout: float = 10.0
+    # Polling must stay responsive, so inspection gets a short deadline while
+    # a load - which can take minutes to pull a large model into VRAM - gets a
+    # generous one. One timeout for both would either stall refreshes or
+    # abandon loads that were still progressing.
+    inspect_timeout: float = 3.0
+    load_timeout: float = 600.0
+    # How many utilization samples each GPU keeps for its sparkline.
+    history_samples: int = 40
+    # Stopping a process is destructive and may be on another machine, so it
+    # is always confirmed in the UI; this disables it outright.
+    allow_process_kill: bool = True
     # VRAM held by a non-model process is reported as an "other" row once it
     # passes this floor; below it a compositor's few MiB is just noise.
     other_min_mb: int = 64

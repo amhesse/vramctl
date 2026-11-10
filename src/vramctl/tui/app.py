@@ -34,6 +34,25 @@ def _gb(mb: int) -> str:
     return f"{mb / 1024:.1f}G" if mb else "0G"
 
 
+SPARK = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+
+
+def _sparkline(samples: list[int], width: int = 24) -> str:
+    """Utilization history as block characters, oldest to newest.
+
+    Scaled against 100% rather than the window's own maximum, so a quiet card
+    stays visibly quiet instead of being rescaled into looking busy.
+    """
+    if not samples:
+        return ""
+    recent = samples[-width:]
+    out = []
+    for value in recent:
+        level = min(len(SPARK) - 1, max(0, round(value / 100 * (len(SPARK) - 1))))
+        out.append(SPARK[level])
+    return "".join(out)
+
+
 def _slug(name: str) -> str:
     """A DOM-id-safe form of a machine name."""
     return "".join(c if c.isalnum() else "-" for c in name) or "node"
@@ -60,25 +79,38 @@ class GpuCard(Static):
     GpuCard:focus { border: round $accent; }
     GpuCard .gpu-title { text-style: bold; }
     GpuCard .gpu-mem { color: $text-muted; }
-    GpuCard .vramctl { color: $text-muted; }
+    GpuCard .gpu-trend { color: $text-muted; }
+    GpuCard .gpu-model-list { color: $text-muted; }
     """
 
-    def __init__(self, gpu: GPUInfo, models: list[LoadedModel]) -> None:
+    def __init__(
+        self,
+        gpu: GPUInfo,
+        models: list[LoadedModel],
+        series: list[int] | None = None,
+    ) -> None:
         super().__init__()
         self.gpu = gpu
         self._title = Label(classes="gpu-title")
         self._mem = Label(classes="gpu-mem")
         self._bar = ProgressBar(total=100, show_eta=False, show_percentage=True)
-        self._models = Label(classes="vramctl")
-        self.set_state(gpu, models)
+        self._trend = Label(classes="gpu-trend")
+        self._models = Label(classes="gpu-model-list")
+        self.set_state(gpu, models, series)
 
     def compose(self) -> ComposeResult:
         yield self._title
         yield self._mem
         yield self._bar
+        yield self._trend
         yield self._models
 
-    def set_state(self, gpu: GPUInfo, models: list[LoadedModel]) -> None:
+    def set_state(
+        self,
+        gpu: GPUInfo,
+        models: list[LoadedModel],
+        series: list[int] | None = None,
+    ) -> None:
         self.gpu = gpu
         self._title.update(f"GPU {gpu.index}  {gpu.short_name}")
         if gpu.declared:
@@ -100,6 +132,14 @@ class GpuCard(Static):
                 f"   {gpu.utilization_pct}% util"
             )
             self._bar.update(progress=round(gpu.used_fraction * 100))
+
+        spark = _sparkline(series or [])
+        sensors = gpu.sensors
+        if spark and sensors:
+            self._trend.update(f"{spark}  {sensors}")
+        else:
+            self._trend.update(spark or sensors or "")
+
         if models:
             lines = "\n".join(
                 f"  \u2022 {m.name}  {_gb(m.vram_mb_per_gpu.get(gpu.index, 0))}"
@@ -464,6 +504,70 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
         return self.choices[index]
 
 
+class ConfirmStopModal(ModalScreen[bool]):
+    """Confirm stopping a process before any signal is sent.
+
+    Stopping is irreversible and may be on another machine, so it is never
+    the default: the dialog opens on Cancel and needs an explicit choice.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("n", "cancel", "No"),
+        Binding("y", "confirm", "Yes"),
+    ]
+
+    DEFAULT_CSS = """
+    ConfirmStopModal { align: center middle; }
+    #confirm-box {
+        width: 72;
+        height: auto;
+        border: round $error;
+        background: $surface;
+        padding: 1 2;
+    }
+    #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
+    .confirm-line { color: $text; }
+    .confirm-hint { color: $text-muted; margin-top: 1; }
+    """
+
+    def __init__(self, model: LoadedModel, remote: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.remote = remote
+
+    def compose(self) -> ComposeResult:
+        m = self.model
+        with Vertical(id="confirm-box"):
+            yield Label("Stop this process?", id="confirm-title")
+            yield Label(f"  {m.name}  (pid {m.pid})", classes="confirm-line")
+            yield Label(
+                f"  on {m.node}" + ("  \u2014 over SSH" if self.remote else "  \u2014 locally"),
+                classes="confirm-line",
+            )
+            yield Label(
+                f"  holding {_gb(m.vram_mb)} VRAM on {m.location}",
+                classes="confirm-line",
+            )
+            if not m.manageable:
+                yield Label(
+                    "  This is not a model vramctl manages. Whatever it is "
+                    "doing will end.",
+                    classes="confirm-line",
+                )
+            yield Label(
+                "SIGTERM, then SIGKILL if it ignores that.  y: stop  \u00b7  "
+                "n / esc: cancel",
+                classes="confirm-hint",
+            )
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+
 class VramctlApp(App[None]):
     """Arrow-key dashboard over GPUs, RAM, and loaded models."""
 
@@ -484,6 +588,7 @@ class VramctlApp(App[None]):
         Binding("l", "load", "Load"),
         Binding("s", "split", "Split/Move"),
         Binding("u", "unload", "Unload"),
+        Binding("k", "stop_process", "Stop proc"),
         Binding("r", "refresh", "Refresh"),
         Binding("left", "focus_prev_gpu", "Prev GPU", show=False),
         Binding("right", "focus_next_gpu", "Next GPU", show=False),
@@ -568,7 +673,11 @@ class VramctlApp(App[None]):
                 for gpu in node.gpus:
                     card = self._cards.get((node.name, gpu.index))
                     if card is not None:
-                        card.set_state(gpu, state.models_on_gpu(node.name, gpu.index))
+                        card.set_state(
+                            gpu,
+                            state.models_on_gpu(node.name, gpu.index),
+                            self.manager.series_for(node.name, gpu.index),
+                        )
             return
 
         container.remove_children()
@@ -590,7 +699,11 @@ class VramctlApp(App[None]):
             container.mount(row)
             cards = []
             for gpu in node.gpus:
-                card = GpuCard(gpu, state.models_on_gpu(node.name, gpu.index))
+                card = GpuCard(
+                    gpu,
+                    state.models_on_gpu(node.name, gpu.index),
+                    self.manager.series_for(node.name, gpu.index),
+                )
                 self._cards[(node.name, gpu.index)] = card
                 cards.append(card)
             row.mount_all(cards)
@@ -691,12 +804,63 @@ class VramctlApp(App[None]):
             return
         if not model.manageable:
             self.notify(
-                f"{model.name} is not a model vramctl manages - stop it on "
-                f"{model.node} yourself to free its VRAM",
+                f"{model.name} is not a model vramctl manages - press 'k' to "
+                f"stop the process on {model.node} instead",
                 severity="warning",
             )
             return
         self._run_unload(model)
+
+    def action_stop_process(self) -> None:
+        """Stop the process behind the selected row, after confirmation.
+
+        Deliberately a separate key from unload: `u` asks a backend to release
+        a model, while this kills a process, possibly on another machine.
+        """
+        model = self.selected_model
+        if model is None:
+            self.notify("Select a row first", severity="warning")
+            return
+        if not self.manager.config.allow_process_kill:
+            self.notify(
+                "Stopping processes is disabled (allow_process_kill is false)",
+                severity="warning",
+            )
+            return
+        if model.pid is None:
+            self.notify(
+                f"{model.name} has no pid - it is reported by an API, not a "
+                f"process. Use 'u' to unload it.",
+                severity="warning",
+            )
+            return
+
+        node = next(
+            (n for n in self.manager.nodes if n.name == model.node), None
+        )
+        if node is None or not node.measurable:
+            self.notify(f"No way to reach {model.node}", severity="error")
+            return
+
+        self.push_screen(
+            ConfirmStopModal(model, remote=bool(node.ssh) and not node.local),
+            lambda ok: self._run_stop(model) if ok else None,
+        )
+
+    @work(exclusive=True, thread=True)
+    def _run_stop(self, model: LoadedModel) -> None:
+        self._busy = True
+        self.call_from_thread(
+            self._set_status, f"Stopping {model.name} (pid {model.pid}) on {model.node}\u2026"
+        )
+        try:
+            result = self.manager.stop_process(model)
+            self.call_from_thread(self.notify, result)
+        except BackendError as exc:
+            self.call_from_thread(self.notify, str(exc), severity="error")
+        finally:
+            self._busy = False
+            self.call_from_thread(self._render, self.manager.state)
 
     def _on_load_result(self, result) -> None:
         if result is None:

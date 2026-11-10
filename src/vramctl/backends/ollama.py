@@ -42,7 +42,9 @@ class OllamaBackend:
         self.endpoint = endpoint or EndpointConfig(url=config.ollama_url)
         self.base_url = self.endpoint.url.rstrip("/")
         self.node = node
-        self.timeout = config.request_timeout
+        # Inspection is on the refresh path, so it must fail fast; a load is
+        # not, and may legitimately take minutes to pull weights into VRAM.
+        self.timeout = config.inspect_timeout
 
     @property
     def label(self) -> str:
@@ -67,9 +69,11 @@ class OllamaBackend:
         except ValueError as exc:
             raise BackendError(f"ollama {self.label}{path}: invalid JSON") from exc
 
-    def _post(self, path: str, payload: dict) -> dict:
+    def _post(self, path: str, payload: dict, timeout: float | None = None) -> dict:
         try:
-            resp = httpx.post(f"{self.base_url}{path}", json=payload, timeout=self.timeout)
+            resp = httpx.post(
+                f"{self.base_url}{path}", json=payload, timeout=timeout or self.timeout
+            )
             resp.raise_for_status()
             return resp.json() if resp.content else {}
         except httpx.HTTPError as exc:
@@ -187,6 +191,7 @@ class OllamaBackend:
                 "keep_alive": "30m",
                 "options": options,
             },
+            timeout=self.config.load_timeout,
         )
 
     def _main_gpu(self, placement: PlacementConfig) -> int:

@@ -45,7 +45,8 @@ class StrataBackend:
     def __init__(self, config: Config, node: str = "", local: bool = True) -> None:
         self.config = config
         self.base_url = config.strata_url
-        self.timeout = config.request_timeout
+        # Status is polled on the refresh path, so it fails fast.
+        self.timeout = config.inspect_timeout
         self.node = node
         self.local = local
 
