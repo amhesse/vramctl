@@ -316,6 +316,43 @@ def _meter(segments: list[tuple[int, str]], total: int, width: int) -> str:
     return "".join(out)
 
 
+def _held_on(gpu: GPUInfo, models: list[LoadedModel]) -> list[tuple]:
+    """Models occupying this card, largest share first."""
+    held = [
+        (m, m.vram_mb_per_gpu.get(gpu.index, 0))
+        for m in models
+        if m.vram_mb_per_gpu.get(gpu.index, 0) > 0
+    ]
+    held.sort(key=lambda pair: -pair[1])
+    return held
+
+
+def _legend_rows(held: list, gpu: GPUInfo, paint: Paint) -> list[str]:
+    """Name each coloured run, so the bar is readable without a key.
+
+    A module function rather than a method: the row height has to be agreed
+    before any card exists, and counting the rows that will really be drawn
+    is the only way to get it right - estimating missed the "other
+    processes" line.
+    """
+    lines: list[str] = []
+    for model, mb in held[:3]:
+        swatch = f"[{paint.for_model(model)}]\u25a0[/]"
+        lines.append(f"  {swatch} {escape(model.name)}  {_gb(mb)}")
+    if len(held) > 3:
+        rest = sum(mb for _, mb in held[3:])
+        lines.append(f"  [dim]+{len(held) - 3} more  {_gb(rest)}[/]")
+    if not gpu.declared:
+        other = max(0, gpu.memory_used_mb - sum(mb for _, mb in held))
+        if other > 0:
+            # A card can be busy with things that are not models at all;
+            # calling that "idle" is what made the bar look wrong.
+            lines.append(
+                f"  [{paint.muted}]\u25a0[/] [dim]other processes  {_gb(other)}[/]"
+            )
+    return lines or ["  [dim](idle)[/]"]
+
+
 def _slug(name: str) -> str:
     """A DOM-id-safe form of a machine name."""
     return "".join(c if c.isalnum() else "-" for c in name) or "node"
@@ -363,11 +400,13 @@ class GpuCard(Static):
         series: list[int] | None = None,
         paint: Paint | None = None,
         height: int = 3,
+        legend_pad: int = 0,
     ) -> None:
         super().__init__()
         self.gpu = gpu
         self._paint = paint or Paint()
         self._height = max(1, height)
+        self._legend_pad = max(0, legend_pad)
         self._title = Label(classes="gpu-title")
         self._vram = Label(classes="gpu-meter")
         self._legend = Label(classes="gpu-legend")
@@ -415,22 +454,20 @@ class GpuCard(Static):
         series: list[int] | None = None,
         paint: Paint | None = None,
         height: int | None = None,
+        legend_pad: int | None = None,
     ) -> None:
         self.gpu = gpu
         if paint is not None:
             self._paint = paint
         if height:
             self._height = max(1, height)
+        if legend_pad is not None:
+            self._legend_pad = max(0, legend_pad)
         self._last = (gpu, models, series, self._paint, self._height)
         sensors = "" if gpu.declared else gpu.sensors
         width = self._meter_width(sensors)
 
-        held = [
-            (m, m.vram_mb_per_gpu.get(gpu.index, 0))
-            for m in models
-            if m.vram_mb_per_gpu.get(gpu.index, 0) > 0
-        ]
-        held.sort(key=lambda pair: -pair[1])
+        held = _held_on(gpu, models)
 
         if gpu.declared:
             # Nothing was measured, so the only real figure is what the
@@ -498,29 +535,14 @@ class GpuCard(Static):
                 reading += f"   [dim]{sensors}[/]"
             self._trend.update(_labelled_block("util", rows, reading))
 
-        self._legend.update(self._legend_text(held, gpu))
+        self._legend.update(self._legend_text(held, gpu, self._legend_pad))
 
-    def _legend_text(self, held: list, gpu: GPUInfo) -> str:
-        """Name each coloured run, so the bar is readable without a key."""
-        lines = []
-        for model, mb in held[:3]:
-            swatch = f"[{self._paint.for_model(model)}]\u25a0[/]"
-            lines.append(f"  {swatch} {escape(model.name)}  {_gb(mb)}")
-        if len(held) > 3:
-            rest = sum(mb for _, mb in held[3:])
-            lines.append(f"  [dim]+{len(held) - 3} more  {_gb(rest)}[/]")
-        if not gpu.declared:
-            other = max(0, gpu.memory_used_mb - sum(mb for _, mb in held))
-            if other > 0:
-                # A card can be busy with things that are not models at all;
-                # calling that "idle" is what made the bar look wrong.
-                lines.append(
-                    f"  [{self._paint.muted}]\u25a0[/] [dim]other processes  "
-                    f"{_gb(other)}[/]"
-                )
-        if not lines:
-            return "  [dim](idle)[/]"
-        return "\n".join(lines)
+    def _legend_text(self, held: list, gpu: GPUInfo, pad_to: int = 0) -> str:
+        rows = _legend_rows(held, gpu, self._paint)
+        # Blank rows so neighbouring cards end up the same height: one holding
+        # two models should not stand taller than the one beside it.
+        rows.extend([""] * max(0, pad_to - len(rows)))
+        return "\n".join(rows)
 
 
 class ModelRow(ListItem):
@@ -1438,6 +1460,7 @@ class VramctlApp(App[None]):
                 self.query_one(f"#hdr-{_slug(node.name)}", Label).update(
                     self._node_header(node)
                 )
+                pad = self._legend_pad_for(node, state, paint)
                 for gpu in node.gpus:
                     card = self._cards.get((node.name, gpu.index))
                     if card is not None:
@@ -1447,6 +1470,7 @@ class VramctlApp(App[None]):
                             self.manager.series_for(node.name, gpu.index),
                             paint=paint,
                             height=self.graph_height,
+                            legend_pad=pad,
                         )
             return
 
@@ -1468,6 +1492,7 @@ class VramctlApp(App[None]):
             row = Horizontal(classes="gpu-row")
             container.mount(row)
             cards = []
+            pad = self._legend_pad_for(node, state, paint)
             for gpu in node.gpus:
                 card = GpuCard(
                     gpu,
@@ -1475,11 +1500,26 @@ class VramctlApp(App[None]):
                     self.manager.series_for(node.name, gpu.index),
                     paint=paint,
                     height=self.graph_height,
+                    legend_pad=pad,
                 )
                 self._cards[(node.name, gpu.index)] = card
                 cards.append(card)
             row.mount_all(cards)
         self._node_shape = shape
+
+    def _legend_pad_for(self, node, state: ClusterState, paint: Paint) -> int:
+        """The legend height every card on this machine should share."""
+        wanted = [
+            len(
+                _legend_rows(
+                    _held_on(gpu, state.models_on_gpu(node.name, gpu.index)),
+                    gpu,
+                    paint,
+                )
+            )
+            for gpu in node.gpus
+        ]
+        return max(wanted) if wanted else 0
 
     def _render_models(self, state: ClusterState, paint: Paint) -> None:
         """Update the model list, preserving the cursor across refreshes."""
