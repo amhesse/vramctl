@@ -156,9 +156,12 @@ class StrataBackend:
     def list_available(self) -> list[AvailableModel]:
         """What Strata could serve.
 
-        Strata holds one model at a time and exposes no catalogue, so this is
-        whatever is on disk in the configured directories.
+        Empty while the backend is observe-only: offering a model in the load
+        modal that ``load()`` would then refuse is just noise. Configure
+        ``strata_load_path`` and the on-disk catalogue appears.
         """
+        if not self.config.strata_load_path:
+            return []
         return self.discover_strata_models()
 
     def discover_strata_models(
