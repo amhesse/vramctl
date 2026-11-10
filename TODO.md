@@ -13,19 +13,19 @@
 
 ## Next
 
-- [ ] Multi-endpoint `nodes[]` config: one Ollama URL per GPU, with the endpoint
+- [x] Multi-endpoint `nodes[]` config: one Ollama URL per GPU, with the endpoint
       as the GPU identity (`:11434` -> 3090 Ti, `:11435` -> 4070 Ti SUPER, both
       enforced by `DevicePolicy=closed` + a single `DeviceAllow` in each unit's
       `zz-gpu-pin.conf`).
-- [ ] Fix `OllamaBackend.load()` to send `main_gpu: 0` per endpoint. A physical
+- [x] Fix `OllamaBackend.load()` to send `main_gpu: 0` per endpoint. A physical
       index is wrong: each instance's cgroup exposes exactly one card, which
       enumerates as device 0 inside the service.
-- [ ] Drop the `_attribute_vram()` PID heuristic for endpoint-pinned instances;
+- [x] Drop the `_attribute_vram()` PID heuristic for endpoint-pinned instances;
       the endpoint already identifies the GPU exactly.
-- [ ] SSH telemetry for `katana-laptop` (192.168.157.49, passwordless, user
+- [x] SSH telemetry for `katana-laptop` (192.168.157.49, passwordless, user
       `aaron`), with declared VRAM capacity as the fallback. Short timeout and
       graceful `unreachable` state, since the laptop sleeps.
-- [ ] Blocked, needs Aaron: laptop `nvidia-smi` returns `Failed to initialize
+- [x] Blocked, needs Aaron: laptop `nvidia-smi` returns `Failed to initialize
       NVML: Driver/library version mismatch` (NVML 615.78). Needs a reboot.
 - [ ] Blocked, needs Aaron: Strata's real port (the `8181` default is invented)
       and its install source - no pacman/pip/docker/dotfile trace remains.

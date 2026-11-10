@@ -26,6 +26,14 @@ class GPUInfo:
     utilization_pct: int = 0
     # pid -> MiB that pid has allocated on *this* GPU
     pids: dict[int, int] = field(default_factory=dict)
+    # Which machine this card is in, and whether the totals were measured by
+    # nvidia-smi or merely declared in config because the host was unreachable.
+    node: str = ""
+    declared: bool = False
+
+    @property
+    def key(self) -> tuple[str, int]:
+        return (self.node, self.index)
 
     @property
     def memory_free_mb(self) -> int:
@@ -104,6 +112,11 @@ class AvailableModel:
     handle: str
     size_mb: int = 0
     detail: str = ""
+    # Where loading it would land. For a pinned Ollama endpoint the GPU is not
+    # a choice: the endpoint is the card.
+    node: str = ""
+    endpoint: str = ""
+    pinned_gpu: int | None = None
 
 
 @dataclass
@@ -115,15 +128,27 @@ class LoadedModel:
     handle: str
     placement: PlacementConfig
     pid: int | None = None
-    # gpu index -> MiB resident on that GPU
+    # gpu index -> MiB resident on that GPU (indices are local to ``node``)
     vram_mb_per_gpu: dict[int, int] = field(default_factory=dict)
     ram_mb: int = 0
     size_mb: int = 0
     detail: str = ""
+    # Which machine holds this model, and the endpoint it was seen through.
+    node: str = ""
+    endpoint: str = ""
 
     @property
     def key(self) -> str:
-        return f"{self.backend}:{self.handle}:{self.pid or 0}"
+        return f"{self.node}:{self.backend}:{self.endpoint}:{self.handle}:{self.pid or 0}"
+
+    @property
+    def spread(self) -> str:
+        """How the model is split between VRAM and host RAM."""
+        if self.vram_mb and self.ram_mb:
+            return "split"
+        if self.vram_mb:
+            return "vram"
+        return "ram"
 
     @property
     def vram_mb(self) -> int:
@@ -135,18 +160,98 @@ class LoadedModel:
 
 
 @dataclass
-class ClusterState:
+class GPUDecl:
+    """Declared GPU facts, used when a host cannot be measured."""
+
+    index: int
+    name: str = "GPU"
+    vram_mb: int = 0
+
+
+@dataclass
+class EndpointConfig:
+    """One backend endpoint, optionally pinned to a single GPU.
+
+    ``gpu`` is the index *on its node*. When set, the endpoint is the GPU's
+    identity: everything it reports lives on that card, and no PID guessing is
+    needed. It also means the instance sees exactly one device, so a load must
+    address it as device 0.
+    """
+
+    url: str
+    gpu: int | None = None
+    label: str = ""
+    backend: str = OLLAMA
+
+    @property
+    def name(self) -> str:
+        return self.label or self.url
+
+
+@dataclass
+class NodeConfig:
+    """A machine holding GPUs.
+
+    ``local`` nodes are measured with a subprocess; ``ssh`` nodes through that
+    SSH destination. Process-detecting backends (llama.cpp, Strata) need
+    ``/proc``, so they run on local nodes only.
+    """
+
+    name: str
+    local: bool = False
+    ssh: str | None = None
+    endpoints: list[EndpointConfig] = field(default_factory=list)
+    llamacpp: bool = False
+    strata_url: str | None = None
+    gpus: list[GPUDecl] = field(default_factory=list)
+
+    @property
+    def measurable(self) -> bool:
+        return self.local or bool(self.ssh)
+
+
+@dataclass
+class NodeState:
+    name: str
     gpus: list[GPUInfo] = field(default_factory=list)
     ram: SystemRAM | None = None
+    reachable: bool = True
+    error: str = ""
+
+
+@dataclass
+class ClusterState:
+    nodes: list[NodeState] = field(default_factory=list)
     models: list[LoadedModel] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
-    def models_on_gpu(self, index: int) -> list[LoadedModel]:
-        return [m for m in self.models if index in m.vram_mb_per_gpu]
+    @property
+    def gpus(self) -> list[GPUInfo]:
+        """Every GPU in the cluster, flattened."""
+        return [gpu for node in self.nodes for gpu in node.gpus]
+
+    @property
+    def ram(self) -> SystemRAM | None:
+        """Host RAM of the first local node, for the single-machine case."""
+        return next((n.ram for n in self.nodes if n.ram), None)
+
+    def models_on_gpu(self, node: str, index: int) -> list[LoadedModel]:
+        return [
+            m
+            for m in self.models
+            if m.node == node and index in m.vram_mb_per_gpu
+        ]
+
+    def models_on_node(self, node: str) -> list[LoadedModel]:
+        return [m for m in self.models if m.node == node]
 
 
 @dataclass
 class Config:
+    # One entry per machine. Built from the legacy flat fields below when the
+    # config file does not declare any.
+    nodes: list[NodeConfig] = field(default_factory=list)
+
     ollama_url: str = "http://localhost:11434"
     ollama_enabled: bool = True
 
@@ -169,6 +274,10 @@ class Config:
 
     refresh_seconds: float = 3.0
     request_timeout: float = 10.0
+    # SSH is far slower than a local subprocess, so remote GPU telemetry is
+    # cached between refreshes rather than re-polled on every tick.
+    ssh_timeout: float = 4.0
+    remote_telemetry_seconds: float = 15.0
 
 
 DEFAULT_GGUF_DIRS = [
@@ -201,6 +310,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
 
     cfg = Config(gguf_dirs=list(DEFAULT_GGUF_DIRS), strata_dirs=list(DEFAULT_GGUF_DIRS))
 
+    raw_nodes: list | None = None
     candidates = [path] if path else CONFIG_PATHS
     for candidate in candidates:
         if candidate is None:
@@ -212,9 +322,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             raw = json.loads(file.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"cannot read config {file}: {exc}") from exc
+        raw_nodes = raw.get("nodes")
         known = {f.name for f in cfg.__dataclass_fields__.values()}
         for key, value in raw.items():
-            if key in known:
+            if key in known and key != "nodes":
                 setattr(cfg, key, value)
         break
 
@@ -236,4 +347,91 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     cfg.strata_url = cfg.strata_url.rstrip("/")
     cfg.gguf_dirs = _expand_dirs(cfg.gguf_dirs)
     cfg.strata_dirs = _expand_dirs(cfg.strata_dirs)
+    cfg.nodes = _build_nodes(cfg, raw_nodes)
     return cfg
+
+
+def _build_nodes(cfg: Config, raw_nodes: list | None) -> list[NodeConfig]:
+    """Parse ``nodes[]``, or synthesize one local node from the flat fields.
+
+    Without a ``nodes`` key the tool behaves as it always did: this machine,
+    one Ollama URL, plus the process-detecting backends.
+    """
+
+    if not raw_nodes:
+        return [
+            NodeConfig(
+                name=_local_name(),
+                local=True,
+                endpoints=(
+                    [EndpointConfig(url=cfg.ollama_url)] if cfg.ollama_enabled else []
+                ),
+                llamacpp=cfg.llamacpp_enabled,
+                strata_url=cfg.strata_url if cfg.strata_enabled else None,
+            )
+        ]
+
+    nodes: list[NodeConfig] = []
+    for entry in raw_nodes:
+        if not isinstance(entry, dict):
+            raise ValueError(f"each node must be an object, got {type(entry).__name__}")
+        ssh = entry.get("ssh")
+        local = bool(entry.get("local", not ssh))
+        name = str(entry.get("name") or ssh or (_local_name() if local else "node"))
+
+        endpoints: list[EndpointConfig] = []
+        for raw in entry.get("ollama", []) or []:
+            if isinstance(raw, str):
+                endpoints.append(EndpointConfig(url=raw.rstrip("/")))
+                continue
+            if not isinstance(raw, dict) or not raw.get("url"):
+                raise ValueError(f"node {name}: each ollama entry needs a url")
+            gpu = raw.get("gpu")
+            endpoints.append(
+                EndpointConfig(
+                    url=str(raw["url"]).rstrip("/"),
+                    gpu=int(gpu) if gpu is not None else None,
+                    label=str(raw.get("label") or ""),
+                )
+            )
+
+        gpus: list[GPUDecl] = []
+        for raw in entry.get("gpus", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            gpus.append(
+                GPUDecl(
+                    index=int(raw.get("index", len(gpus))),
+                    name=str(raw.get("name") or "GPU"),
+                    vram_mb=int(raw.get("vram_mb") or 0),
+                )
+            )
+
+        strata = entry.get("strata")
+        strata_url = None
+        if isinstance(strata, str):
+            strata_url = strata.rstrip("/")
+        elif isinstance(strata, dict) and strata.get("url"):
+            strata_url = str(strata["url"]).rstrip("/")
+
+        nodes.append(
+            NodeConfig(
+                name=name,
+                local=local,
+                ssh=str(ssh) if ssh else None,
+                endpoints=endpoints,
+                llamacpp=bool(entry.get("llamacpp", local)),
+                strata_url=strata_url,
+                gpus=gpus,
+            )
+        )
+    return nodes
+
+
+def _local_name() -> str:
+    import socket
+
+    try:
+        return socket.gethostname() or "local"
+    except OSError:
+        return "local"

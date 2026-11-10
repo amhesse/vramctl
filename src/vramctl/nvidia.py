@@ -23,23 +23,74 @@ def nvidia_smi_available() -> bool:
     return shutil.which(NVIDIA_SMI) is not None
 
 
-def _run(args: list[str], timeout: float) -> str:
-    try:
-        proc = subprocess.run(
-            [NVIDIA_SMI, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise NvidiaError("nvidia-smi not found on PATH") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise NvidiaError(f"nvidia-smi timed out after {timeout}s") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip().splitlines()
-        raise NvidiaError(f"nvidia-smi failed: {detail[0] if detail else 'unknown error'}")
-    return proc.stdout
+class LocalRunner:
+    """Runs probes on this machine."""
+
+    name = "local"
+    remote = False
+
+    def run(self, args: list[str], timeout: float) -> str:
+        try:
+            proc = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except FileNotFoundError as exc:
+            raise NvidiaError(f"{args[0]} not found on PATH") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise NvidiaError(f"{args[0]} timed out after {timeout}s") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            raise NvidiaError(
+                f"{args[0]} failed: {detail[0] if detail else 'unknown error'}"
+            )
+        return proc.stdout
+
+
+class SshRunner:
+    """Runs probes on another machine over SSH.
+
+    ``BatchMode=yes`` keeps a missing key from hanging on a password prompt,
+    which would otherwise stall a refresh until the timeout.
+    """
+
+    remote = True
+
+    def __init__(self, destination: str, timeout: float = 4.0) -> None:
+        self.destination = destination
+        self.name = destination
+        self.connect_timeout = max(1, int(timeout))
+
+    def run(self, args: list[str], timeout: float) -> str:
+        ssh_args = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={self.connect_timeout}",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            self.destination,
+            "--",
+            *args,
+        ]
+        try:
+            proc = subprocess.run(
+                ssh_args, capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except FileNotFoundError as exc:
+            raise NvidiaError("ssh not found on PATH") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise NvidiaError(f"{self.destination}: unreachable after {timeout}s") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            first = detail[0] if detail else f"exit {proc.returncode}"
+            raise NvidiaError(f"{self.destination}: {first}")
+        return proc.stdout
+
+
+def _run(args: list[str], timeout: float, runner=None) -> str:
+    runner = runner or LocalRunner()
+    return runner.run([NVIDIA_SMI, *args], timeout)
 
 
 def _rows(output: str, expected: int) -> list[list[str]]:
@@ -71,7 +122,7 @@ def _to_int(value: str) -> int:
         return 0
 
 
-def query_gpus(timeout: float = 5.0) -> list[GPUInfo]:
+def query_gpus(timeout: float = 5.0, runner=None, node: str = "") -> list[GPUInfo]:
     """Return every visible GPU with its VRAM totals and per-PID allocations.
 
     ``--query-compute-apps`` identifies GPUs by UUID rather than index, so the
@@ -79,7 +130,7 @@ def query_gpus(timeout: float = 5.0) -> list[GPUInfo]:
     """
 
     gpu_out = _run(
-        ["--query-gpu=" + _GPU_FIELDS, "--format=csv,noheader,nounits"], timeout
+        ["--query-gpu=" + _GPU_FIELDS, "--format=csv,noheader,nounits"], timeout, runner
     )
     gpus: list[GPUInfo] = []
     by_uuid: dict[str, GPUInfo] = {}
@@ -91,6 +142,7 @@ def query_gpus(timeout: float = 5.0) -> list[GPUInfo]:
             memory_total_mb=_to_mb(total),
             memory_used_mb=_to_mb(used),
             utilization_pct=_to_int(util),
+            node=node,
         )
         gpus.append(gpu)
         by_uuid[uuid] = gpu
@@ -99,6 +151,7 @@ def query_gpus(timeout: float = 5.0) -> list[GPUInfo]:
         app_out = _run(
             ["--query-compute-apps=" + _APP_FIELDS, "--format=csv,noheader,nounits"],
             timeout,
+            runner,
         )
     except NvidiaError:
         # No compute apps (or an unsupported driver) leaves VRAM totals intact.
@@ -117,13 +170,53 @@ def query_gpus(timeout: float = 5.0) -> list[GPUInfo]:
     return gpus
 
 
-def query_system_ram() -> SystemRAM:
-    vm = psutil.virtual_memory()
+def query_system_ram(runner=None, timeout: float = 5.0) -> SystemRAM:
+    """Host RAM, from psutil locally or ``/proc/meminfo`` over SSH."""
+    if runner is None or not getattr(runner, "remote", False):
+        vm = psutil.virtual_memory()
+        return SystemRAM(
+            total_mb=vm.total // MIB,
+            used_mb=(vm.total - vm.available) // MIB,
+            available_mb=vm.available // MIB,
+        )
+
+    out = runner.run(["cat", "/proc/meminfo"], timeout)
+    fields: dict[str, int] = {}
+    for line in out.splitlines():
+        key, _, rest = line.partition(":")
+        value = rest.strip().split(" ")[0] if rest else ""
+        try:
+            fields[key.strip()] = int(value)  # kB
+        except ValueError:
+            continue
+    total_kb = fields.get("MemTotal", 0)
+    avail_kb = fields.get("MemAvailable", fields.get("MemFree", 0))
     return SystemRAM(
-        total_mb=vm.total // MIB,
-        used_mb=(vm.total - vm.available) // MIB,
-        available_mb=vm.available // MIB,
+        total_mb=total_kb // 1024,
+        used_mb=max(0, (total_kb - avail_kb) // 1024),
+        available_mb=avail_kb // 1024,
     )
+
+
+def declared_gpus(decls, node: str) -> list[GPUInfo]:
+    """GPU rows from config, for a host that cannot be measured.
+
+    ``memory_used_mb`` stays 0: nothing was measured, so the only honest
+    number is what the backends themselves report holding.
+    """
+    return [
+        GPUInfo(
+            index=d.index,
+            uuid=f"declared-{node}-{d.index}",
+            name=d.name,
+            memory_total_mb=d.vram_mb,
+            memory_used_mb=0,
+            utilization_pct=0,
+            node=node,
+            declared=True,
+        )
+        for d in decls
+    ]
 
 
 def gpu_pid_map(gpus: list[GPUInfo]) -> dict[int, dict[int, int]]:

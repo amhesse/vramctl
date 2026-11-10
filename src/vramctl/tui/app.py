@@ -24,6 +24,7 @@ from vramctl.config import (
     ClusterState,
     GPUInfo,
     LoadedModel,
+    NodeState,
     PlacementConfig,
 )
 from vramctl.manager import ClusterManager
@@ -31,6 +32,11 @@ from vramctl.manager import ClusterManager
 
 def _gb(mb: int) -> str:
     return f"{mb / 1024:.1f}G" if mb else "0G"
+
+
+def _slug(name: str) -> str:
+    """A DOM-id-safe form of a machine name."""
+    return "".join(c if c.isalnum() else "-" for c in name) or "node"
 
 
 class GpuCard(Static):
@@ -75,11 +81,25 @@ class GpuCard(Static):
     def set_state(self, gpu: GPUInfo, models: list[LoadedModel]) -> None:
         self.gpu = gpu
         self._title.update(f"GPU {gpu.index}  {gpu.short_name}")
-        self._mem.update(
-            f"{_gb(gpu.memory_used_mb)} / {_gb(gpu.memory_total_mb)} VRAM"
-            f"   {gpu.utilization_pct}% util"
-        )
-        self._bar.update(progress=round(gpu.used_fraction * 100))
+        if gpu.declared:
+            # Nothing was measured, so only what the backends admit to holding
+            # is real. Saying "declared" beats implying a reading.
+            held = sum(m.vram_mb_per_gpu.get(gpu.index, 0) for m in models)
+            self._mem.update(
+                f"{_gb(held)} held / {_gb(gpu.memory_total_mb)} declared"
+                "   util unknown"
+            )
+            self._bar.update(
+                progress=round(100 * held / gpu.memory_total_mb)
+                if gpu.memory_total_mb
+                else 0
+            )
+        else:
+            self._mem.update(
+                f"{_gb(gpu.memory_used_mb)} / {_gb(gpu.memory_total_mb)} VRAM"
+                f"   {gpu.utilization_pct}% util"
+            )
+            self._bar.update(progress=round(gpu.used_fraction * 100))
         if models:
             lines = "\n".join(
                 f"  \u2022 {m.name}  {_gb(m.vram_mb_per_gpu.get(gpu.index, 0))}"
@@ -109,6 +129,8 @@ class ModelRow(ListItem):
         yield self._main
         yield self._sub
 
+    SPREAD_MARK = {"vram": "\u25b0\u25b0", "split": "\u25b0\u25b1", "ram": "\u25b1\u25b1"}
+
     def set_model(self, model: LoadedModel) -> None:
         self.model = model
         where = (
@@ -116,20 +138,28 @@ class ModelRow(ListItem):
         )
         pid = f" \u00b7 pid {model.pid}" if model.pid else ""
         detail = f" \u00b7 {model.detail}" if model.detail else ""
-        self._main.update(f"[{model.backend}] {model.name}")
-        self._sub.update(
-            f"    {where} \u00b7 VRAM {_gb(model.vram_mb)} \u00b7 "
-            f"RAM {_gb(model.ram_mb)}{pid}{detail}"
+        endpoint = f" \u00b7 {model.endpoint}" if model.endpoint else ""
+        mark = self.SPREAD_MARK.get(model.spread, "")
+        self._main.update(
+            f"{mark} {model.node}  [{model.backend}] {model.name}"
+            if model.node
+            else f"{mark} [{model.backend}] {model.name}"
         )
+        split = f"VRAM {_gb(model.vram_mb)} \u00b7 RAM {_gb(model.ram_mb)}"
+        if model.spread == "split" and model.size_mb:
+            pct = round(100 * model.vram_mb / model.size_mb)
+            split += f" ({pct}% on GPU)"
+        self._sub.update(f"    {where} \u00b7 {split}{endpoint}{pid}{detail}")
 
 
 class GpuToggleItem(ListItem):
     """A GPU in the modal's target list, checkable with space."""
 
-    def __init__(self, gpu: GPUInfo, selected: bool) -> None:
+    def __init__(self, gpu: GPUInfo, selected: bool, show_node: bool = False) -> None:
         super().__init__()
         self.gpu = gpu
         self.selected = selected
+        self.show_node = show_node
         self._label = Label()
         self._refresh()
 
@@ -142,9 +172,14 @@ class GpuToggleItem(ListItem):
 
     def _refresh(self) -> None:
         mark = "x" if self.selected else " "
+        where = f"{self.gpu.node} " if self.show_node and self.gpu.node else ""
+        free = (
+            f"{_gb(self.gpu.memory_total_mb)} declared"
+            if self.gpu.declared
+            else f"{_gb(self.gpu.memory_free_mb)} free"
+        )
         self._label.update(
-            f"[{mark}] GPU {self.gpu.index}  {self.gpu.short_name}  "
-            f"({_gb(self.gpu.memory_free_mb)} free)"
+            f"[{mark}] {where}GPU {self.gpu.index}  {self.gpu.short_name}  ({free})"
         )
 
 
@@ -175,6 +210,7 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
     #modal-models { height: 8; border: round $panel-lighten-2; }
     #modal-gpus { height: auto; max-height: 6; border: round $panel-lighten-2; }
     .modal-hint { color: $text-muted; }
+    .modal-target { color: $accent; text-style: bold; }
     """
 
     def __init__(
@@ -193,6 +229,7 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
         self.initial = initial or PlacementConfig(
             gpu_ids=[g.index for g in gpus[:1]]
         )
+        self._multi_node = len({g.node for g in gpus if g.node}) > 1
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-box"):
@@ -202,7 +239,13 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
                 yield Label("Model (\u2191/\u2193 to choose):", classes="modal-hint")
                 yield ListView(
                     *[
-                        ListItem(Label(f"[{m.backend}] {m.name}  {_gb(m.size_mb)}"))
+                        ListItem(
+                            Label(
+                                f"[{m.backend}] {m.name}  {_gb(m.size_mb)}"
+                                + (f"   {m.node}" if m.node else "")
+                                + (f" \u00b7 {m.endpoint}" if m.endpoint else "")
+                            )
+                        )
                         for m in self.choices
                     ],
                     id="modal-models",
@@ -213,10 +256,15 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
                     classes="modal-hint",
                 )
 
+            yield Label(id="modal-target", classes="modal-target")
             yield Label("Target GPUs (space to toggle):", classes="modal-hint")
             yield ListView(
                 *[
-                    GpuToggleItem(gpu, gpu.index in self.initial.gpu_ids)
+                    GpuToggleItem(
+                        gpu,
+                        gpu.index in self.initial.gpu_ids,
+                        show_node=self._multi_node,
+                    )
                     for gpu in self.gpus
                 ],
                 id="modal-gpus",
@@ -250,10 +298,57 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
             )
 
     def on_mount(self) -> None:
+        self._render_target()
         if self.fixed_model is None and self.choices:
             self.query_one("#modal-models", ListView).focus()
         elif self.gpus:
             self.query_one("#modal-gpus", ListView).focus()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if event.list_view.id == "modal-models":
+            self._render_target()
+
+    def _render_target(self) -> None:
+        """Say where the load will actually land.
+
+        For a pinned Ollama endpoint the card is not up for selection - the
+        endpoint already decides it - so the GPU toggles do not apply.
+        """
+        try:
+            label = self.query_one("#modal-target", Label)
+        except Exception:
+            return
+        model = self._chosen_model()
+        if model is None:
+            label.update("Target: pick a model")
+            return
+        if self.fixed_model is not None and model.backend == "ollama":
+            picked = self.selected_gpus
+            if picked:
+                label.update(
+                    f"Target: {model.node} \u2192 GPU {picked[0]} "
+                    f"(switches to that card's endpoint; unload + reload)"
+                )
+            else:
+                label.update(
+                    f"Target: {model.node} \u2192 RAM only (unload + reload)"
+                )
+            return
+        if model.backend == "ollama":
+            where = model.node or "local"
+            if model.pinned_gpu is not None:
+                label.update(
+                    f"Target: {where} \u00b7 {model.endpoint} \u2192 "
+                    f"GPU {model.pinned_gpu} (fixed by the endpoint; "
+                    f"toggles below do not apply)"
+                )
+            else:
+                label.update(
+                    f"Target: {where} \u00b7 {model.endpoint} "
+                    f"(unpinned; main_gpu follows your selection)"
+                )
+            return
+        label.update(f"Target: {model.node or 'local'} \u00b7 {model.backend}")
 
     @property
     def selected_gpus(self) -> list[int]:
@@ -272,6 +367,7 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
         item = gpu_list.highlighted_child
         if isinstance(item, GpuToggleItem):
             item.toggle()
+            self._render_target()
             event.stop()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
@@ -279,6 +375,7 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
         if event.list_view.id == "modal-gpus":
             if isinstance(event.item, GpuToggleItem):
                 event.item.toggle()
+                self._render_target()
             return
         self.action_confirm()
 
@@ -295,6 +392,10 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
             return
 
         gpu_ids = self.selected_gpus
+        if model.backend == "ollama" and model.pinned_gpu is not None:
+            # The endpoint is the card; recording anything else would make the
+            # panel disagree with where the model lands.
+            gpu_ids = [model.pinned_gpu]
 
         layers_raw = self.query_one("#modal-layers", Input).value.strip()
         layers: int | None = None
@@ -351,6 +452,8 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
                 name=self.fixed_model.name,
                 handle=self.fixed_model.handle,
                 size_mb=self.fixed_model.size_mb,
+                node=self.fixed_model.node,
+                endpoint=self.fixed_model.endpoint,
             )
         if not self.choices:
             return None
@@ -367,8 +470,10 @@ class VramctlApp(App[None]):
     TITLE = "vramctl"
 
     CSS = """
-    #gpu-row { height: auto; }
-    #ram-line { padding: 0 1; color: $text-muted; }
+    #nodes { height: auto; }
+    .gpu-row { height: auto; }
+    .node-header { padding: 0 1; text-style: bold; color: $accent; }
+    .node-empty { padding: 0 1; color: $text-muted; }
     #models-title { padding: 0 1; text-style: bold; }
     #models { height: 1fr; border: round $panel-lighten-2; margin: 0 1; }
     #models:focus-within { border: round $accent; }
@@ -389,12 +494,15 @@ class VramctlApp(App[None]):
         super().__init__()
         self.manager = manager or ClusterManager()
         self._busy = False
+        # Cards are built once per (node, gpu) and updated in place; remounting
+        # them every tick would drop keyboard focus mid-poll.
+        self._cards: dict[tuple[str, int], GpuCard] = {}
+        self._node_shape: list = []
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield VerticalScroll(
-            Horizontal(id="gpu-row"),
-            Label(id="ram-line"),
+            Vertical(id="nodes"),
             Label("Loaded models", id="models-title"),
             ListView(id="models"),
             Label(id="status"),
@@ -412,51 +520,77 @@ class VramctlApp(App[None]):
             self.refresh_state()
 
     @work(exclusive=True, thread=True)
-    def refresh_state(self) -> None:
-        """Poll off the UI thread; nvidia-smi and HTTP both block."""
-        state = self.manager.refresh_state()
+    def refresh_state(self, force: bool = False) -> None:
+        """Poll off the UI thread; nvidia-smi, ssh and HTTP all block."""
+        state = self.manager.refresh_state(force_telemetry=force)
         self.call_from_thread(self._render, state)
 
     def _render(self, state: ClusterState) -> None:
-        self._render_gpus(state)
-
-        if state.ram:
-            ram = state.ram
-            self.query_one("#ram-line", Label).update(
-                f"System RAM  {_gb(ram.used_mb)} / {_gb(ram.total_mb)} "
-                f"({_gb(ram.available_mb)} available)"
-            )
-
+        self._render_nodes(state)
         self._render_models(state)
 
         status = self.query_one("#status", Label)
         if state.errors:
-            status.update("\u26a0 " + "  ".join(state.errors))
+            status.update("\u26a0 " + "  ".join(state.errors[:2]))
         else:
             count = len(state.models)
-            status.update(f"{count} model{'' if count == 1 else 's'} resident")
+            gpus = len(state.gpus)
+            status.update(
+                f"{count} model{'' if count == 1 else 's'} across "
+                f"{gpus} GPU{'' if gpus == 1 else 's'} on "
+                f"{len(state.nodes)} machine{'' if len(state.nodes) == 1 else 's'}"
+            )
 
-    def _render_gpus(self, state: ClusterState) -> None:
-        """Update the GPU cards, remounting only if the GPU set changed."""
-        row = self.query_one("#gpu-row", Horizontal)
-        cards = list(self.query(GpuCard))
-        indices = [g.index for g in state.gpus]
+    def _node_header(self, node: NodeState) -> str:
+        bits = [node.name]
+        if node.ram:
+            bits.append(
+                f"RAM {_gb(node.ram.used_mb)}/{_gb(node.ram.total_mb)}"
+            )
+        if not node.reachable:
+            bits.append("\u26a0 unreachable, showing declared capacity")
+        return "  \u00b7  ".join(bits)
 
-        if [c.gpu.index for c in cards] == indices and cards:
-            for card in cards:
-                card.set_state(
-                    next(g for g in state.gpus if g.index == card.gpu.index),
-                    state.models_on_gpu(card.gpu.index),
+    def _render_nodes(self, state: ClusterState) -> None:
+        """Render one section per machine, remounting only if the shape changed."""
+        container = self.query_one("#nodes", Vertical)
+        shape = [(n.name, tuple(g.index for g in n.gpus)) for n in state.nodes]
+
+        if shape == self._node_shape and shape:
+            for node in state.nodes:
+                self.query_one(f"#hdr-{_slug(node.name)}", Label).update(
+                    self._node_header(node)
                 )
+                for gpu in node.gpus:
+                    card = self._cards.get((node.name, gpu.index))
+                    if card is not None:
+                        card.set_state(gpu, state.models_on_gpu(node.name, gpu.index))
             return
 
-        row.remove_children()
-        if state.gpus:
-            row.mount_all(
-                GpuCard(gpu, state.models_on_gpu(gpu.index)) for gpu in state.gpus
+        container.remove_children()
+        self._cards.clear()
+        if not state.nodes:
+            container.mount(Label("  No machines configured"))
+            self._node_shape = shape
+            return
+
+        for node in state.nodes:
+            container.mount(
+                Label(self._node_header(node), id=f"hdr-{_slug(node.name)}",
+                      classes="node-header")
             )
-        else:
-            row.mount(Label("  No NVIDIA GPUs detected"))
+            if not node.gpus:
+                container.mount(Label("    (no GPUs reported)", classes="node-empty"))
+                continue
+            row = Horizontal(classes="gpu-row")
+            container.mount(row)
+            cards = []
+            for gpu in node.gpus:
+                card = GpuCard(gpu, state.models_on_gpu(node.name, gpu.index))
+                self._cards[(node.name, gpu.index)] = card
+                cards.append(card)
+            row.mount_all(cards)
+        self._node_shape = shape
 
     def _render_models(self, state: ClusterState) -> None:
         """Update the model list, preserving the cursor across refreshes."""
@@ -469,9 +603,11 @@ class VramctlApp(App[None]):
                 row.set_model(model)
             return
 
-        # The set changed, so rebuild — but keep the cursor on the same model
-        # if it is still loaded.
-        selected_key = rows[view.index].model.key if rows and view.index is not None and view.index < len(rows) else None
+        selected_key = (
+            rows[view.index].model.key
+            if rows and view.index is not None and view.index < len(rows)
+            else None
+        )
         view.clear()
         for model in state.models:
             view.append(ModelRow(model))
@@ -487,7 +623,8 @@ class VramctlApp(App[None]):
     # --- actions --------------------------------------------------------
 
     def action_refresh(self) -> None:
-        self.refresh_state()
+        """Manual refresh re-reads remote hardware instead of using the cache."""
+        self.refresh_state(force=True)
 
     def action_focus_next_gpu(self) -> None:
         self._cycle_gpu(1)
@@ -523,10 +660,12 @@ class VramctlApp(App[None]):
         if model is None:
             self.notify("Select a loaded model first", severity="warning")
             return
+        # Moving a model is only meaningful within its own machine.
+        same_node = [g for g in self.manager.state.gpus if g.node == model.node]
         self.push_screen(
             LoadOrSplitModal(
-                f"Move or re-split {model.name}",
-                self.manager.state.gpus,
+                f"Move or re-split {model.name} on {model.node}",
+                same_node or self.manager.state.gpus,
                 choices=None,
                 fixed_model=model,
                 initial=model.placement,

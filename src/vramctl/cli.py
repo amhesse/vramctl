@@ -86,30 +86,43 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_once(manager: ClusterManager, as_json: bool) -> int:
-    state = manager.refresh_state()
+    state = manager.refresh_state(force_telemetry=True)
 
     if as_json:
         payload = {
-            "gpus": [
+            "nodes": [
                 {
-                    "index": g.index,
-                    "name": g.name,
-                    "memory_total_mb": g.memory_total_mb,
-                    "memory_used_mb": g.memory_used_mb,
-                    "utilization_pct": g.utilization_pct,
-                    "pids": g.pids,
+                    "name": n.name,
+                    "reachable": n.reachable,
+                    "error": n.error or None,
+                    "ram": vars(n.ram) if n.ram else None,
+                    "gpus": [
+                        {
+                            "index": g.index,
+                            "name": g.name,
+                            "memory_total_mb": g.memory_total_mb,
+                            "memory_used_mb": g.memory_used_mb,
+                            "utilization_pct": g.utilization_pct,
+                            "declared": g.declared,
+                            "pids": g.pids,
+                        }
+                        for g in n.gpus
+                    ],
                 }
-                for g in state.gpus
+                for n in state.nodes
             ],
-            "ram": vars(state.ram) if state.ram else None,
             "models": [
                 {
+                    "node": m.node,
                     "backend": m.backend,
+                    "endpoint": m.endpoint,
                     "name": m.name,
                     "pid": m.pid,
                     "vram_mb_per_gpu": m.vram_mb_per_gpu,
+                    "vram_mb": m.vram_mb,
                     "ram_mb": m.ram_mb,
                     "size_mb": m.size_mb,
+                    "spread": m.spread,
                     "placement": m.placement.describe(),
                 }
                 for m in state.models
@@ -119,23 +132,38 @@ def _print_once(manager: ClusterManager, as_json: bool) -> int:
         print(json.dumps(payload, indent=2))
         return 1 if state.errors and not state.gpus else 0
 
-    for gpu in state.gpus:
-        print(
-            f"GPU {gpu.index}  {gpu.short_name:<24} "
-            f"{gpu.memory_used_mb:>6}/{gpu.memory_total_mb} MiB  "
-            f"{gpu.utilization_pct:>3}% util"
-        )
-    if state.ram:
-        ram = state.ram
-        print(f"RAM        {ram.used_mb:>6}/{ram.total_mb} MiB")
+    for node in state.nodes:
+        header = node.name
+        if not node.reachable:
+            header += "  (unreachable, declared capacity)"
+        print(header)
+        for gpu in node.gpus:
+            if gpu.declared:
+                held = sum(
+                    m.vram_mb_per_gpu.get(gpu.index, 0)
+                    for m in state.models_on_gpu(node.name, gpu.index)
+                )
+                print(
+                    f"  GPU {gpu.index}  {gpu.short_name:<24} "
+                    f"{held:>6}/{gpu.memory_total_mb} MiB held/declared"
+                )
+            else:
+                print(
+                    f"  GPU {gpu.index}  {gpu.short_name:<24} "
+                    f"{gpu.memory_used_mb:>6}/{gpu.memory_total_mb} MiB  "
+                    f"{gpu.utilization_pct:>3}% util"
+                )
+        if node.ram:
+            print(f"  RAM        {node.ram.used_mb:>6}/{node.ram.total_mb} MiB")
+        print()
 
-    print()
     if state.models:
-        for model in state.models:
-            where = model.placement.describe()
+        print(f"{'MACHINE':<16} {'BACKEND':<9} {'MODEL':<34} "
+              f"{'VRAM':>8} {'RAM':>8}  PLACEMENT")
+        for m in state.models:
             print(
-                f"[{model.backend:<8}] {model.name:<36} "
-                f"VRAM {model.vram_mb:>6} MiB  RAM {model.ram_mb:>6} MiB  {where}"
+                f"{m.node:<16} {m.backend:<9} {m.name[:34]:<34} "
+                f"{m.vram_mb:>8} {m.ram_mb:>8}  {m.placement.describe()}"
             )
     else:
         print("No models resident.")

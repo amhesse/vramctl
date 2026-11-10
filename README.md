@@ -44,17 +44,57 @@ Other flags: `--config FILE`, `--ollama-url URL`, `--strata-url URL`,
 
 ### Configuration
 
-Optional JSON at `~/.config/vramctl/config.json` (or `~/.vramctl.json`);
-every key mirrors a field of `Config` in `src/vramctl/config.py`:
+Optional JSON at `~/.config/vramctl/config.json` (or `~/.vramctl.json`).
+Without a `nodes` key it manages this machine only, and every other key
+mirrors a field of `Config` in `src/vramctl/config.py`.
+
+`nodes` turns it into a cluster view. Each node is a machine; each `ollama`
+entry is an endpoint, and `gpu` pins it to one card **on that node**:
 
 ```json
 {
-  "ollama_url": "http://localhost:11434",
+  "nodes": [
+    {
+      "name": "InferencePrime",
+      "local": true,
+      "ollama": [
+        {"url": "http://127.0.0.1:11434", "gpu": 0, "label": "george"},
+        {"url": "http://127.0.0.1:11435", "gpu": 1, "label": "katie"}
+      ],
+      "llamacpp": true,
+      "strata": {"url": "http://127.0.0.1:8181"}
+    },
+    {
+      "name": "katana-laptop",
+      "ssh": "katana-laptop",
+      "ollama": [{"url": "http://192.168.157.49:11434", "gpu": 0}],
+      "gpus": [{"index": 0, "name": "RTX 4060 Laptop", "vram_mb": 8188}]
+    }
+  ],
   "gguf_dirs": ["~/models", "/mnt/storage/llm"],
   "llama_server_bin": "llama-server",
-  "refresh_seconds": 3.0
+  "refresh_seconds": 3.0,
+  "remote_telemetry_seconds": 15.0
 }
 ```
+
+Notes on nodes:
+
+- A node is measured locally (`"local": true`) or over SSH (`"ssh": "host"`,
+  which must work non-interactively). SSH costs a round trip, so remote GPU
+  and RAM readings are cached for `remote_telemetry_seconds`; `r` forces a
+  re-read.
+- `gpus` declares capacity as a fallback. It is used only when the host cannot
+  be measured, and such a card is labelled `declared` with no utilization,
+  since nothing was actually read.
+- **Pinning `gpu` matters.** When an Ollama instance is confined to one card
+  (on InferencePrime, by `DevicePolicy=closed` plus a single `DeviceAllow`),
+  that card enumerates as CUDA device 0 *inside* the instance. vramctl then
+  sends `main_gpu: 0` and attributes the instance's VRAM to the pinned card
+  with no PID correlation. An unpinned endpoint keeps the physical index.
+- `llamacpp` and `strata` read `/proc`, so they are honoured on local nodes
+  only. A remote machine contributes its GPU/RAM readings and its Ollama
+  endpoints.
 
 `VRAMCTL_OLLAMA_URL`, `VRAMCTL_STRATA_URL`, `VRAMCTL_LLAMA_SERVER`,
 `VRAMCTL_STRATA_BIN`, and `VRAMCTL_GGUF_DIRS` (`:`-separated) override the
