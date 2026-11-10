@@ -83,7 +83,13 @@ class LlamaCppBackend:
                 gguf = _gguf_from_fds(proc.pid)
             per_gpu = vram_by_pid.get(proc.pid, {})
             placement = _placement_from_cmdline(proc.cmdline, sorted(per_gpu))
-            label = Path(gguf).stem if gguf else f"llama.cpp pid {proc.pid}"
+            # A blob path has no meaningful stem, so prefer the alias the
+            # server was started with.
+            label = (
+                _alias_from_cmdline(proc.cmdline)
+                or (Path(gguf).stem if gguf else None)
+                or f"llama.cpp pid {proc.pid}"
+            )
 
             models.append(
                 LoadedModel(
@@ -264,9 +270,28 @@ class LlamaCppBackend:
         raise BackendError(f"no free port in {base}-{base + 63}")
 
 
+def _is_ollama_runner(proc: ProcInfo) -> bool:
+    """True for the llama-server Ollama ships and runs as its own child.
+
+    Ollama bundles a llama-server at a path like
+    ``/usr/local/lib/ollama/llama-server`` and spawns it per loaded model.
+    Those are already reported through ``/api/ps`` under a real tag, so
+    claiming them here shows one model twice - once as ``codestral:22b`` and
+    once as the sha256 of its blob.
+
+    Only the binary's own path counts. A llama-server the user launched
+    themselves stays visible even when it is pointed at an Ollama blob,
+    because that is a process they manage and we should not hide it.
+    """
+    if not proc.cmdline:
+        return False
+    argv0 = proc.cmdline[0]
+    return "/ollama/" in argv0 or Path(argv0).name == "ollama"
+
+
 def _is_llamacpp(proc: ProcInfo) -> bool:
     """Match llama.cpp binaries without catching every ``server`` on the box."""
-    if not proc.cmdline:
+    if not proc.cmdline or _is_ollama_runner(proc):
         return False
     exe = proc.exe_name.lower()
     if exe in {"llama-server", "llama-cli", "llama-bench"}:
@@ -276,6 +301,15 @@ def _is_llamacpp(proc: ProcInfo) -> bool:
     if exe in {"server", "main"}:
         return any(arg.endswith(".gguf") for arg in proc.cmdline)
     return False
+
+
+def _alias_from_cmdline(cmdline: list[str]) -> str | None:
+    for index, arg in enumerate(cmdline):
+        if arg == "--alias" and index + 1 < len(cmdline):
+            return cmdline[index + 1]
+        if arg.startswith("--alias="):
+            return arg.split("=", 1)[1]
+    return None
 
 
 def _gguf_from_cmdline(cmdline: list[str]) -> str | None:

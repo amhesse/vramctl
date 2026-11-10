@@ -186,8 +186,12 @@ class ModelRow(ListItem):
             else f"{mark} [{model.backend}] {model.name}"
         )
         split = f"VRAM {_gb(model.vram_mb)} \u00b7 RAM {_gb(model.ram_mb)}"
-        if model.spread == "split" and model.size_mb:
-            pct = round(100 * model.vram_mb / model.size_mb)
+        # Share of what is actually resident, not of the file on disk: VRAM
+        # also holds the KV cache, compute buffers and CUDA context, so
+        # measuring against the file size can exceed 100%.
+        resident = model.vram_mb + model.ram_mb
+        if model.spread == "split" and resident:
+            pct = round(100 * model.vram_mb / resident)
             split += f" ({pct}% on GPU)"
         self._sub.update(f"    {where} \u00b7 {split}{endpoint}{pid}{detail}")
 
