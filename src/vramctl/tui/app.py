@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 
 from rich.markup import escape
 
+from pathlib import Path
+
 from textual import work
+from textual.app import SystemCommand
 from textual.color import Color
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -24,6 +27,7 @@ from textual.widgets import (
 
 from vramctl.backends.base import BackendError
 from vramctl.config import (
+    CONFIG_PATHS,
     AvailableModel,
     ClusterState,
     GPUInfo,
@@ -520,13 +524,18 @@ class GpuCard(Static):
 
 
 class ModelRow(ListItem):
-    """One loaded model, with its placement and memory split."""
+    """One loaded model, tagged with the colour of its VRAM bar segment."""
 
     DEFAULT_CSS = """
     ModelRow { padding: 0 1; height: auto; }
     ModelRow .row-main { text-style: bold; }
     ModelRow .row-sub { color: $text-muted; }
+    /* Highlight colours live in the app stylesheet: ListView's own
+       "ListView:focus > ListItem.-highlight" rule is more specific than
+       anything that can be written here, so a rule at this level loses. */
     """
+
+    SPREAD_MARK = {"vram": "\u25b0\u25b0", "split": "\u25b0\u25b1", "ram": "\u25b1\u25b1"}
 
     def __init__(self, model: LoadedModel, paint: Paint | None = None) -> None:
         super().__init__()
@@ -539,43 +548,58 @@ class ModelRow(ListItem):
         yield self._main
         yield self._sub
 
-    SPREAD_MARK = {"vram": "\u25b0\u25b0", "split": "\u25b0\u25b1", "ram": "\u25b1\u25b1"}
-
     def set_model(self, model: LoadedModel, paint: Paint | None = None) -> None:
         self.model = model
         if paint is not None:
             self._paint = paint
-        where = model.location
-        pid = f" \u00b7 pid {model.pid}" if model.pid else ""
-        detail = f" \u00b7 {model.detail}" if model.detail else ""
-        endpoint = f" \u00b7 {model.endpoint}" if model.endpoint else ""
+
+        # The same colour this model has in the GPU card above, so the two can
+        # be matched by eye. A solid block reads on any background, including
+        # the selection highlight.
+        tag = f"[{self._paint.for_model(model)}]\u25a0[/]"
         # The marker describes how a *model* is placed. Another process always
         # has RSS, so showing it as "split" would say nothing.
         mark = self.SPREAD_MARK.get(model.spread, "") if model.manageable else "\u2022"
-        self._main.update(
-            f"{mark} {model.node}  [{model.backend}] {model.name}"
-            if model.node
-            else f"{mark} [{model.backend}] {model.name}"
-        )
+
+        # No inline colour on the main line beyond the tag: anything dimmed
+        # here would survive the highlight and become unreadable.
+        name = escape(model.name)
+        node = escape(model.node)
+        self._main.update(f"{tag} {mark} {node}  {name}" if node else f"{tag} {mark} {name}")
+
         split = f"VRAM {_gb(model.vram_mb)} \u00b7 RAM {_gb(model.ram_mb)}"
         # Share of what is actually resident, not of the file on disk: VRAM
         # also holds the KV cache, compute buffers and CUDA context, so
         # measuring against the file size can exceed 100%.
         resident = model.vram_mb + model.ram_mb
         if model.spread == "split" and resident:
-            pct = round(100 * model.vram_mb / resident)
-            split += f" ({pct}% on GPU)"
-        self._sub.update(f"    {where} \u00b7 {split}{endpoint}{pid}{detail}")
+            split += f" ({round(100 * model.vram_mb / resident)}% on GPU)"
+
+        bits = [escape(model.backend), escape(model.location), split]
+        if model.endpoint:
+            bits.append(escape(model.endpoint))
+        if model.pid:
+            bits.append(f"pid {model.pid}")
+        if model.detail:
+            bits.append(escape(model.detail))
+        self._sub.update("    " + " \u00b7 ".join(b for b in bits if b))
 
 
 class GpuToggleItem(ListItem):
-    """A GPU in the modal's target list, checkable with space."""
+    """A GPU in the modal's target list, checkable with space.
+
+    Selection is shown with a filled glyph *and* brightness, not an ASCII
+    ``[x]``: markup treats ``[x]`` as a style tag and swallows it, so the
+    checkbox vanished exactly when it was ticked.
+    """
 
     def __init__(self, gpu: GPUInfo, selected: bool, show_node: bool = False) -> None:
         super().__init__()
         self.gpu = gpu
         self.selected = selected
         self.show_node = show_node
+        # False when the chosen model's endpoint already decides the card.
+        self.applies = True
         self._label = Label()
         self._refresh()
 
@@ -583,20 +607,29 @@ class GpuToggleItem(ListItem):
         yield self._label
 
     def toggle(self) -> None:
+        if not self.applies:
+            return
         self.selected = not self.selected
         self._refresh()
 
+    def set_applies(self, applies: bool) -> None:
+        self.applies = applies
+        self._refresh()
+
     def _refresh(self) -> None:
-        mark = "x" if self.selected else " "
         where = f"{self.gpu.node} " if self.show_node and self.gpu.node else ""
         free = (
             f"{_gb(self.gpu.memory_total_mb)} declared"
             if self.gpu.declared
             else f"{_gb(self.gpu.memory_free_mb)} free"
         )
-        self._label.update(
-            f"[{mark}] {where}GPU {self.gpu.index}  {self.gpu.short_name}  ({free})"
-        )
+        body = f"{where}GPU {self.gpu.index}  {self.gpu.short_name}  ({free})"
+        if not self.applies:
+            self._label.update(f"[dim]\u00b7 {escape(body)}   set by the endpoint[/]")
+        elif self.selected:
+            self._label.update(f"[b][green]\u25c9[/] {escape(body)}   selected[/]")
+        else:
+            self._label.update(f"[dim]\u25cb {escape(body)}[/]")
 
 
 class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None]):
@@ -657,9 +690,14 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
                     *[
                         ListItem(
                             Label(
-                                f"[{m.backend}] {m.name}  {_gb(m.size_mb)}"
-                                + (f"   {m.node}" if m.node else "")
-                                + (f" \u00b7 {m.endpoint}" if m.endpoint else "")
+                                f"[dim]{m.backend}[/] {escape(m.name)}  "
+                                f"{_gb(m.size_mb)}"
+                                + (f"   {escape(m.node)}" if m.node else "")
+                                + (
+                                    f" \u00b7 {escape(m.endpoint)}"
+                                    if m.endpoint
+                                    else ""
+                                )
                             )
                         )
                         for m in self.choices
@@ -673,7 +711,7 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
                 )
 
             yield Label(id="modal-target", classes="modal-target")
-            yield Label("Target GPUs (space to toggle):", classes="modal-hint")
+            yield Label(id="modal-gpu-label", classes="modal-hint")
             yield ListView(
                 *[
                     GpuToggleItem(
@@ -715,6 +753,7 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
 
     def on_mount(self) -> None:
         self._render_target()
+        self._sync_applicability()
         if self.fixed_model is None and self.choices:
             self.query_one("#modal-models", ListView).focus()
         elif self.gpus:
@@ -723,6 +762,60 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if event.list_view.id == "modal-models":
             self._render_target()
+            self._sync_applicability()
+
+    def _gpu_choice_applies(self) -> bool:
+        """Whether picking a GPU here changes anything.
+
+        A pinned Ollama endpoint already fixes the card, so offering live
+        checkboxes would invite a choice that is quietly ignored.
+        """
+        model = self._chosen_model()
+        if model is None:
+            return True
+        if self.fixed_model is not None:
+            # Moving a loaded model does depend on the card chosen here.
+            return True
+        return not (model.backend == "ollama" and model.pinned_gpu is not None)
+
+    def _target_node(self) -> str:
+        model = self._chosen_model()
+        return (model.node if model else "") or ""
+
+    def _sync_applicability(self) -> None:
+        """Enable only the cards that the chosen model could actually use.
+
+        A model is loaded by a backend on one machine, so GPUs on any other
+        machine are not candidates - and because indices are per machine,
+        leaving them selectable would mix two different cards numbered 0.
+        """
+        applies = self._gpu_choice_applies()
+        node = self._target_node()
+        items = list(self.query(GpuToggleItem))
+        for item in items:
+            on_target = not node or not item.gpu.node or item.gpu.node == node
+            item.set_applies(applies and on_target)
+
+        # A selection on another machine is kept, not cleared: moving the
+        # cursor over a model should not silently discard what was ticked.
+        # It simply does not count while it cannot be honoured.
+        if not applies:
+            return
+        usable = [item for item in items if item.applies]
+        if usable and not any(item.selected for item in usable):
+            # Without a default, confirming here would load the model to host
+            # RAM rather than the card the user was looking at.
+            usable[0].selected = True
+            usable[0].set_applies(True)
+        try:
+            label = self.query_one("#modal-gpu-label", Label)
+        except Exception:
+            return
+        label.update(
+            "Target GPUs (space to toggle):"
+            if applies
+            else "Target GPU is fixed by the endpoint:"
+        )
 
     def _render_target(self) -> None:
         """Say where the load will actually land.
@@ -768,10 +861,17 @@ class LoadOrSplitModal(ModalScreen[tuple[AvailableModel, PlacementConfig] | None
 
     @property
     def selected_gpus(self) -> list[int]:
+        """Chosen GPU indices on the target machine.
+
+        Only applicable items count. GPU indices are per machine, so without
+        that filter two nodes that both have a GPU 0 would yield [0, 0].
+        """
         return sorted(
-            item.gpu.index
-            for item in self.query(GpuToggleItem)
-            if item.selected
+            {
+                item.gpu.index
+                for item in self.query(GpuToggleItem)
+                if item.selected and item.applies
+            }
         )
 
     def on_key(self, event) -> None:
@@ -1080,6 +1180,20 @@ class VramctlApp(App[None]):
     .node-empty { padding: 0 1; color: $text-muted; }
     #models-title { padding: 0 1; text-style: bold; }
     #models { height: 1fr; border: round $panel-lighten-2; margin: 0 1; }
+    /* A selected row sits on the theme's cursor background. Our labels set
+       their own colour, so they do not inherit the matching foreground and
+       the text can end up unreadable - black on navy, or muted grey on a
+       saturated accent. Borrow the theme's own cursor foreground, which its
+       author chose to pair with that background. */
+    #models > ModelRow.-highlight .row-main,
+    #models > ModelRow.-highlight .row-sub {
+        color: $block-cursor-blurred-foreground;
+    }
+    #models:focus > ModelRow.-highlight .row-main,
+    #models:focus > ModelRow.-highlight .row-sub {
+        color: $block-cursor-foreground;
+    }
+    #models:focus > ModelRow.-highlight .row-main { text-style: bold; }
     #models:focus-within { border: round $accent; }
     #status { padding: 0 1; color: $text-muted; }
     """
@@ -1096,6 +1210,16 @@ class VramctlApp(App[None]):
         Binding("left", "focus_prev_gpu", "Prev GPU", show=False),
         Binding("right", "focus_next_gpu", "Next GPU", show=False),
         Binding("q", "quit", "Quit"),
+        # Declared rather than left to Textual, which would otherwise add this
+        # itself labelled "palette". Textual skips its own if one is already
+        # bound to command_palette.
+        Binding(
+            "ctrl+p",
+            "command_palette",
+            "Menu",
+            priority=True,
+            tooltip="Open the menu: everything the keys do, searchable",
+        ),
     ]
 
     def __init__(self, manager: ClusterManager | None = None) -> None:
@@ -1167,6 +1291,71 @@ class VramctlApp(App[None]):
         self.prefs.graph_height = height
         save_prefs(self.prefs)
         self.notify(f"Graph height {height}", timeout=1.5)
+
+    def get_system_commands(self, screen):
+        """Everything the keys do, searchable from the menu.
+
+        The bare keys stay the fast path; this is for the ones worth having a
+        name, and for anything that has no key at all.
+        """
+        for command in super().get_system_commands(screen):
+            # Textual ships its own theme switcher. Ours previews on the real
+            # UI and remembers the choice, so two entries called "Theme" would
+            # only be a coin toss for the user.
+            if command.title == "Theme":
+                continue
+            yield command
+
+        yield SystemCommand(
+            "Refresh now",
+            "Re-read GPUs, RAM and every backend, including remote hosts",
+            self.action_refresh,
+        )
+        yield SystemCommand(
+            "Theme", "Preview and choose a theme; the choice is remembered",
+            self.action_theme,
+        )
+        yield SystemCommand(
+            "Load a model", "Pick a model and where to put it", self.action_load
+        )
+        yield SystemCommand(
+            "Move or re-split the selected model",
+            "Unload it and bring it back on different cards",
+            self.action_split,
+        )
+        yield SystemCommand(
+            "Unload the selected model",
+            "Evict it and free its VRAM",
+            self.action_unload,
+        )
+        yield SystemCommand(
+            "Graphs: taller",
+            f"Add a row to each bar graph (now {self.graph_height})",
+            self.action_taller,
+        )
+        yield SystemCommand(
+            "Graphs: shorter",
+            f"Remove a row from each bar graph (now {self.graph_height})",
+            self.action_shorter,
+        )
+        yield SystemCommand(
+            "Where settings live",
+            "Show the config and preferences paths",
+            self.action_show_paths,
+        )
+
+    def action_show_paths(self) -> None:
+        """Say where config and preferences are read from and written to."""
+        config = next(
+            (str(Path(c).expanduser()) for c in CONFIG_PATHS
+             if Path(c).expanduser().is_file()),
+            "none found, using defaults",
+        )
+        self.notify(
+            f"config: {config}\nprefs: {prefs_path()}",
+            title="Settings",
+            timeout=10,
+        )
 
     def action_theme(self) -> None:
         self.push_screen(ThemePicker(self.theme), self._on_theme_chosen)
