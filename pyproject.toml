@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vramctl"
+version = "0.1.0"
+description = "Interactive TUI for inspecting and splitting LLM workloads across NVIDIA GPUs and system RAM"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.80",
+    "httpx>=0.27",
+    "psutil>=5.9",
+]
+
+[project.scripts]
+vramctl = "vramctl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
