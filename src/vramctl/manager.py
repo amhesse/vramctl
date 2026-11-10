@@ -9,6 +9,7 @@ from vramctl.backends.llamacpp import LlamaCppBackend
 from vramctl.backends.ollama import OllamaBackend
 from vramctl.backends.strata import StrataBackend
 from vramctl.config import (
+    OTHER,
     AvailableModel,
     ClusterState,
     Config,
@@ -19,14 +20,8 @@ from vramctl.config import (
     PlacementConfig,
     load_config,
 )
-from vramctl.nvidia import (
-    LocalRunner,
-    NvidiaError,
-    SshRunner,
-    declared_gpus,
-    query_gpus,
-    query_system_ram,
-)
+from vramctl.nvidia import LocalRunner, SshRunner, declared_gpus
+from vramctl.probe import probe_local, probe_remote
 
 
 class _Telemetry:
@@ -70,23 +65,23 @@ class _Telemetry:
         if not force and self.fetched_at and age < self.interval:
             return self.state
 
-        timeout = self.config.ssh_timeout if self.runner.remote else 5.0
-        state = NodeState(name=self.node.name)
-        try:
-            state.gpus = query_gpus(timeout, self.runner, self.node.name)
-            state.reachable = True
-        except NvidiaError as exc:
+        if self.runner.remote:
+            probe = probe_remote(self.runner, self.node.name, self.config.ssh_timeout)
+        else:
+            probe = probe_local(self.node.name)
+
+        state = NodeState(
+            name=self.node.name,
+            gpus=probe.gpus,
+            ram=probe.ram,
+            procs=probe.procs,
+            reachable=probe.measured,
+            error=probe.error,
+        )
+        if not probe.measured:
             # Fall back to what config declares, flagged as unmeasured, so the
             # panel still shows the machine instead of dropping it.
             state.gpus = declared_gpus(self.node.gpus, self.node.name)
-            state.reachable = False
-            state.error = str(exc)
-
-        try:
-            state.ram = query_system_ram(self.runner, timeout)
-        except (NvidiaError, OSError) as exc:
-            if not state.error:
-                state.error = f"ram: {exc}"
 
         self.state = state
         self.fetched_at = time.time()
@@ -116,12 +111,17 @@ class ClusterManager:
             self._telemetry[node.name] = _Telemetry(node, self.config)
             for endpoint in node.endpoints:
                 self.ollama.append(OllamaBackend(self.config, endpoint, node.name))
-            # llama.cpp and Strata read /proc, so they only work where we run.
-            if node.llamacpp and node.local:
-                self.llamacpp[node.name] = LlamaCppBackend(self.config)
-            if node.strata_url and node.local:
+            # Detection works from any machine's process table, which may have
+            # been read over SSH. Spawning and signalling stay local.
+            if node.llamacpp:
+                self.llamacpp[node.name] = LlamaCppBackend(
+                    self.config, node.name, local=node.local
+                )
+            if node.strata_url:
                 cfg = _with_strata_url(self.config, node.strata_url)
-                self.strata[node.name] = StrataBackend(cfg)
+                self.strata[node.name] = StrataBackend(
+                    cfg, node.name, local=node.local
+                )
 
     @property
     def nodes(self) -> list[NodeConfig]:
@@ -162,7 +162,7 @@ class ClusterManager:
                 node_state = by_node.get(node_name)
                 gpus = node_state.gpus if node_state else []
                 try:
-                    found = backend.list_running(gpus)
+                    found = backend.list_running(gpus, node_state.procs if node_state else None)
                 except BackendError as exc:
                     state.errors.append(str(exc))
                     continue
@@ -176,10 +176,59 @@ class ClusterManager:
                     model.node = node_name
                     state.models.append(model)
 
+        state.models.extend(self._other_consumers(state))
         state.models.sort(key=lambda m: (m.node, -m.vram_mb, m.backend, m.name))
         self.state = state
         self.last_refresh = time.time()
         return state
+
+    def _other_consumers(self, state: ClusterState) -> list[LoadedModel]:
+        """VRAM held by processes that are not models we manage.
+
+        Without these rows a card can read as half full with nothing on it -
+        a game, ComfyUI or a voice server is invisible. Processes belonging to
+        a backend we already report are skipped, since they are either a model
+        row or the runner behind one, and counting them twice would inflate
+        the totals.
+        """
+
+        floor = self.config.other_min_mb
+        rows: list[LoadedModel] = []
+
+        for node_state in state.nodes:
+            claimed = {
+                m.pid
+                for m in state.models
+                if m.node == node_state.name and m.pid is not None
+            }
+            per_pid: dict[int, dict[int, int]] = {}
+            for gpu in node_state.gpus:
+                for pid, mb in gpu.pids.items():
+                    if pid in claimed:
+                        continue
+                    per_pid.setdefault(pid, {})[gpu.index] = mb
+
+            for pid, per_gpu in per_pid.items():
+                total = sum(per_gpu.values())
+                if total < floor:
+                    continue
+                proc = node_state.procs.get(pid)
+                if proc is not None and proc.is_managed_backend:
+                    continue
+                rows.append(
+                    LoadedModel(
+                        backend=OTHER,
+                        name=proc.summary if proc else f"pid {pid}",
+                        handle=str(pid),
+                        placement=PlacementConfig(gpu_ids=sorted(per_gpu)),
+                        pid=pid,
+                        vram_mb_per_gpu=per_gpu,
+                        ram_mb=node_state.procs.rss_mb(pid),
+                        detail="not a managed model",
+                        node=node_state.name,
+                    )
+                )
+        return rows
 
     def list_available(self) -> list[AvailableModel]:
         """Everything loadable, per endpoint; unreachable backends are skipped."""

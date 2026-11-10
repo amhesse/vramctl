@@ -12,6 +12,84 @@ MIB = 1024 * 1024
 OLLAMA = "ollama"
 LLAMACPP = "llamacpp"
 STRATA = "strata"
+# Not a managed model: something else on the card, named so its VRAM is not
+# simply missing from the picture.
+OTHER = "other"
+
+
+@dataclass
+class ProcInfo:
+    """One process, as seen locally via psutil or remotely via ``ps``."""
+
+    pid: int
+    cmdline: list[str]
+    rss_mb: int = 0
+
+    @property
+    def exe_name(self) -> str:
+        if not self.cmdline:
+            return ""
+        return Path(self.cmdline[0]).name
+
+    # Names that say nothing about what a process actually is, so the label
+    # keeps walking the command line past them.
+    GENERIC = frozenset(
+        {"python", "python3", "uvicorn", "gunicorn", "node", "sh", "bash", "env", "-c"}
+    )
+
+    @property
+    def summary(self) -> str:
+        """A short label naming what the process really is.
+
+        ``python .../uvicorn voice_server:app`` should read as
+        ``voice_server``, not ``python``.
+        """
+        for token in [self.exe_name, *self.cmdline[1:]]:
+            if not token or token.startswith("-"):
+                continue
+            stem = Path(token).name.split(":")[0]
+            if stem and stem.lower() not in self.GENERIC and not stem.startswith("-"):
+                return stem
+        return self.exe_name or f"pid {self.pid}"
+
+    @property
+    def is_managed_backend(self) -> bool:
+        """True for a process belonging to a backend vramctl already reports.
+
+        Such a process is either a model row already or the runner behind one,
+        so counting it again as unattributed VRAM would double-report it.
+        """
+        joined = " ".join(self.cmdline).lower()
+        return any(
+            token in joined
+            for token in ("ollama", "llama-server", "llama-cli", "strata")
+        )
+
+
+@dataclass
+class ProcessTable:
+    """The processes on one machine, keyed by pid.
+
+    Remote tables come from ``ps``, whose ``args`` column is already
+    space-joined, so an argument containing a space cannot be recovered
+    exactly. Paths with spaces are the only practical casualty.
+    """
+
+    node: str = ""
+    procs: dict[int, ProcInfo] = field(default_factory=dict)
+    remote: bool = False
+
+    def get(self, pid: int) -> ProcInfo | None:
+        return self.procs.get(pid)
+
+    def rss_mb(self, pid: int | None) -> int:
+        if pid is None:
+            return 0
+        proc = self.procs.get(pid)
+        return proc.rss_mb if proc else 0
+
+    def matching(self, predicate) -> list[ProcInfo]:
+        return [p for p in self.procs.values() if predicate(p)]
 
 
 @dataclass
@@ -142,6 +220,27 @@ class LoadedModel:
         return f"{self.node}:{self.backend}:{self.endpoint}:{self.handle}:{self.pid or 0}"
 
     @property
+    def location(self) -> str:
+        """Which cards hold it, without claiming anything about layers."""
+        if self.gpu_ids:
+            return "+".join(f"GPU{i}" for i in self.gpu_ids)
+        return "RAM only"
+
+    @property
+    def placement_label(self) -> str:
+        """How to describe where this sits.
+
+        Layer and split language only means something for a model we placed;
+        for someone else's process the cards are all we can honestly say.
+        """
+        return self.placement.describe() if self.manageable else self.location
+
+    @property
+    def manageable(self) -> bool:
+        """False for VRAM we can see but not control, e.g. another app."""
+        return self.backend != OTHER
+
+    @property
     def spread(self) -> str:
         """How the model is split between VRAM and host RAM."""
         if self.vram_mb and self.ram_mb:
@@ -215,6 +314,7 @@ class NodeState:
     name: str
     gpus: list[GPUInfo] = field(default_factory=list)
     ram: SystemRAM | None = None
+    procs: ProcessTable = field(default_factory=ProcessTable)
     reachable: bool = True
     error: str = ""
 
@@ -245,6 +345,11 @@ class ClusterState:
     def models_on_node(self, node: str) -> list[LoadedModel]:
         return [m for m in self.models if m.node == node]
 
+    @property
+    def managed(self) -> list[LoadedModel]:
+        """Only the models vramctl can load or unload."""
+        return [m for m in self.models if m.manageable]
+
 
 @dataclass
 class Config:
@@ -274,6 +379,9 @@ class Config:
 
     refresh_seconds: float = 3.0
     request_timeout: float = 10.0
+    # VRAM held by a non-model process is reported as an "other" row once it
+    # passes this floor; below it a compositor's few MiB is just noise.
+    other_min_mb: int = 64
     # SSH is far slower than a local subprocess, so remote GPU telemetry is
     # cached between refreshes rather than re-polled on every tick.
     ssh_timeout: float = 4.0

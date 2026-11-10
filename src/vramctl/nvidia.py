@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 
@@ -61,6 +62,10 @@ class SshRunner:
         self.connect_timeout = max(1, int(timeout))
 
     def run(self, args: list[str], timeout: float) -> str:
+        # ssh joins its command arguments with spaces and the *remote* shell
+        # parses the result, so each argument must be quoted for that shell or
+        # anything containing a space or a semicolon is torn apart.
+        remote_command = " ".join(shlex.quote(a) for a in args)
         ssh_args = [
             "ssh",
             "-o",
@@ -71,7 +76,7 @@ class SshRunner:
             "StrictHostKeyChecking=accept-new",
             self.destination,
             "--",
-            *args,
+            remote_command,
         ]
         try:
             proc = subprocess.run(

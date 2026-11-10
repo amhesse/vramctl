@@ -79,8 +79,11 @@ class OllamaBackend:
 
     # --- inspection -----------------------------------------------------
 
-    def list_running(self, gpus: list[GPUInfo]) -> list[LoadedModel]:
+    def list_running(self, gpus: list[GPUInfo], procs=None) -> list[LoadedModel]:
         """Map ``GET /api/ps`` onto ``LoadedModel``.
+
+        ``procs`` is unused: Ollama reports its own residency, and the
+        endpoint already identifies the card.
 
         Ollama reports ``size`` (total resident) and ``size_vram`` (the VRAM
         part); the difference is host RAM, which is how a partially offloaded

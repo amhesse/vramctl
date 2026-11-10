@@ -133,13 +133,13 @@ class ModelRow(ListItem):
 
     def set_model(self, model: LoadedModel) -> None:
         self.model = model
-        where = (
-            "+".join(f"GPU{i}" for i in model.gpu_ids) if model.gpu_ids else "RAM only"
-        )
+        where = model.location
         pid = f" \u00b7 pid {model.pid}" if model.pid else ""
         detail = f" \u00b7 {model.detail}" if model.detail else ""
         endpoint = f" \u00b7 {model.endpoint}" if model.endpoint else ""
-        mark = self.SPREAD_MARK.get(model.spread, "")
+        # The marker describes how a *model* is placed. Another process always
+        # has RSS, so showing it as "split" would say nothing.
+        mark = self.SPREAD_MARK.get(model.spread, "") if model.manageable else "\u2022"
         self._main.update(
             f"{mark} {model.node}  [{model.backend}] {model.name}"
             if model.node
@@ -533,13 +533,17 @@ class VramctlApp(App[None]):
         if state.errors:
             status.update("\u26a0 " + "  ".join(state.errors[:2]))
         else:
-            count = len(state.models)
+            count = len(state.managed)
+            others = len(state.models) - count
             gpus = len(state.gpus)
-            status.update(
+            line = (
                 f"{count} model{'' if count == 1 else 's'} across "
                 f"{gpus} GPU{'' if gpus == 1 else 's'} on "
                 f"{len(state.nodes)} machine{'' if len(state.nodes) == 1 else 's'}"
             )
+            if others:
+                line += f"  \u00b7  {others} other VRAM consumer{'' if others == 1 else 's'}"
+            status.update(line)
 
     def _node_header(self, node: NodeState) -> str:
         bits = [node.name]
@@ -660,6 +664,13 @@ class VramctlApp(App[None]):
         if model is None:
             self.notify("Select a loaded model first", severity="warning")
             return
+        if not model.manageable:
+            self.notify(
+                f"{model.name} is not a model vramctl manages - it is another "
+                f"process holding VRAM on {model.node}",
+                severity="warning",
+            )
+            return
         # Moving a model is only meaningful within its own machine.
         same_node = [g for g in self.manager.state.gpus if g.node == model.node]
         self.push_screen(
@@ -677,6 +688,13 @@ class VramctlApp(App[None]):
         model = self.selected_model
         if model is None:
             self.notify("Select a loaded model first", severity="warning")
+            return
+        if not model.manageable:
+            self.notify(
+                f"{model.name} is not a model vramctl manages - stop it on "
+                f"{model.node} yourself to free its VRAM",
+                severity="warning",
+            )
             return
         self._run_unload(model)
 

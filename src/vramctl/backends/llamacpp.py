@@ -20,8 +20,9 @@ from vramctl.config import (
     GPUInfo,
     LoadedModel,
     PlacementConfig,
+    ProcInfo,
+    ProcessTable,
 )
-from vramctl.nvidia import process_ram_mb
 
 
 class LlamaCppBackend:
@@ -35,8 +36,12 @@ class LlamaCppBackend:
 
     name = LLAMACPP
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, node: str = "", local: bool = True) -> None:
         self.config = config
+        self.node = node
+        # Detection works from any machine's process table; spawning and
+        # stopping need the process to be ours, on this machine.
+        self.local = local
         # pid -> (gguf path, placement) for servers we started ourselves
         self._spawned: dict[int, tuple[str, PlacementConfig]] = {}
 
@@ -45,15 +50,24 @@ class LlamaCppBackend:
 
     # --- inspection -----------------------------------------------------
 
-    def list_running(self, gpus: list[GPUInfo]) -> list[LoadedModel]:
-        return self.detect_processes(gpus)
+    def list_running(
+        self, gpus: list[GPUInfo], procs: ProcessTable | None = None
+    ) -> list[LoadedModel]:
+        return self.detect_processes(gpus, procs)
 
-    def detect_processes(self, gpus: list[GPUInfo]) -> list[LoadedModel]:
-        """Find llama.cpp processes, preferring ones holding GPU memory.
+    def detect_processes(
+        self, gpus: list[GPUInfo], procs: ProcessTable | None = None
+    ) -> list[LoadedModel]:
+        """Find llama.cpp processes in a machine's process table.
 
-        A CPU-only ``llama-server`` holds no compute PID, so the process table
-        is scanned too and the GPU map only supplies VRAM attribution.
+        A CPU-only ``llama-server`` holds no compute PID, so the whole table is
+        scanned and the GPU map only supplies VRAM attribution.
         """
+
+        if procs is None:
+            from vramctl.probe import local_process_table
+
+            procs = local_process_table(self.node)
 
         vram_by_pid: dict[int, dict[int, int]] = {}
         for gpu in gpus:
@@ -61,31 +75,28 @@ class LlamaCppBackend:
                 vram_by_pid.setdefault(pid, {})[gpu.index] = mb
 
         models: list[LoadedModel] = []
-        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-            try:
-                pid = proc.info["pid"]
-                cmdline = proc.info["cmdline"] or []
-            except (psutil.Error, OSError):
-                continue
-            if not cmdline or not _is_llamacpp(proc.info.get("name") or "", cmdline):
-                continue
-
-            gguf = _gguf_from_cmdline(cmdline) or _gguf_from_fds(pid)
-            per_gpu = vram_by_pid.get(pid, {})
-            placement = _placement_from_cmdline(cmdline, sorted(per_gpu))
-            label = Path(gguf).stem if gguf else f"llama.cpp pid {pid}"
+        for proc in procs.matching(_is_llamacpp):
+            gguf = _gguf_from_cmdline(proc.cmdline)
+            if gguf is None and not procs.remote:
+                # Only readable for a local process, and only useful when the
+                # model came from a config file rather than the command line.
+                gguf = _gguf_from_fds(proc.pid)
+            per_gpu = vram_by_pid.get(proc.pid, {})
+            placement = _placement_from_cmdline(proc.cmdline, sorted(per_gpu))
+            label = Path(gguf).stem if gguf else f"llama.cpp pid {proc.pid}"
 
             models.append(
                 LoadedModel(
                     backend=self.name,
                     name=label,
-                    handle=gguf or str(pid),
+                    handle=gguf or str(proc.pid),
                     placement=placement,
-                    pid=pid,
+                    pid=proc.pid,
                     vram_mb_per_gpu=per_gpu,
-                    ram_mb=process_ram_mb(pid),
-                    size_mb=_file_mb(gguf),
-                    detail=_detail(cmdline, placement),
+                    ram_mb=proc.rss_mb,
+                    size_mb=_file_mb(gguf) if not procs.remote else 0,
+                    detail=_detail(proc.cmdline, placement),
+                    node=self.node,
                 )
             )
         return models
@@ -122,6 +133,8 @@ class LlamaCppBackend:
         return sorted(found.values(), key=lambda m: m.name)
 
     def list_available(self) -> list[AvailableModel]:
+        if not self.local:
+            return []
         return self.discover_gguf_models()
 
     # --- control --------------------------------------------------------
@@ -135,6 +148,13 @@ class LlamaCppBackend:
             port=placement.port,
         )
 
+    def _require_local(self, action: str) -> None:
+        if not self.local:
+            raise BackendError(
+                f"cannot {action} a llama.cpp server on {self.node}: vramctl "
+                "only observes llama.cpp on remote machines"
+            )
+
     def spawn_model(
         self,
         gguf_path: str,
@@ -145,6 +165,7 @@ class LlamaCppBackend:
     ) -> int:
         """Start ``llama-server`` for ``gguf_path`` and return its pid."""
 
+        self._require_local("start")
         binary = shutil.which(self.config.llama_server_bin)
         if binary is None:
             raise BackendError(
@@ -205,6 +226,7 @@ class LlamaCppBackend:
 
     def stop_model(self, pid: int, timeout: float = 10.0) -> None:
         """SIGTERM the server, escalating to SIGKILL so VRAM is actually freed."""
+        self._require_local("stop")
         try:
             proc = psutil.Process(pid)
         except psutil.NoSuchProcess:
@@ -242,16 +264,17 @@ class LlamaCppBackend:
         raise BackendError(f"no free port in {base}-{base + 63}")
 
 
-def _is_llamacpp(name: str, cmdline: list[str]) -> bool:
+def _is_llamacpp(proc: ProcInfo) -> bool:
     """Match llama.cpp binaries without catching every ``server`` on the box."""
-    exe = Path(cmdline[0]).name.lower()
-    candidates = {exe, name.lower()}
-    if candidates & {"llama-server", "llama-cli", "llama-bench"}:
+    if not proc.cmdline:
+        return False
+    exe = proc.exe_name.lower()
+    if exe in {"llama-server", "llama-cli", "llama-bench"}:
         return True
     # Locally built binaries are often just ./server or ./main, so require a
     # .gguf somewhere on the command line before claiming them.
-    if candidates & {"server", "main"}:
-        return any(arg.endswith(".gguf") for arg in cmdline)
+    if exe in {"server", "main"}:
+        return any(arg.endswith(".gguf") for arg in proc.cmdline)
     return False
 
 

@@ -123,7 +123,8 @@ def _print_once(manager: ClusterManager, as_json: bool) -> int:
                     "ram_mb": m.ram_mb,
                     "size_mb": m.size_mb,
                     "spread": m.spread,
-                    "placement": m.placement.describe(),
+                    "placement": m.placement_label,
+                    "manageable": m.manageable,
                 }
                 for m in state.models
             ],
@@ -163,7 +164,7 @@ def _print_once(manager: ClusterManager, as_json: bool) -> int:
         for m in state.models:
             print(
                 f"{m.node:<16} {m.backend:<9} {m.name[:34]:<34} "
-                f"{m.vram_mb:>8} {m.ram_mb:>8}  {m.placement.describe()}"
+                f"{m.vram_mb:>8} {m.ram_mb:>8}  {m.placement_label}"
             )
     else:
         print("No models resident.")

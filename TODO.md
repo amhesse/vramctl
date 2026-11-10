@@ -29,5 +29,17 @@
       NVML: Driver/library version mismatch` (NVML 615.78). Needs a reboot.
 - [ ] Blocked, needs Aaron: Strata's real port (the `8181` default is invented)
       and its install source - no pacman/pip/docker/dotfile trace remains.
+- [x] Remote process detection: read each node's process table with `ps` in
+      the same SSH call as its GPU and RAM figures, so a remote `llama-server`
+      or Strata instance is visible rather than anonymous VRAM.
+- [x] `other` rows for VRAM held by processes vramctl does not manage, with a
+      `other_min_mb` floor and a guard against double-counting a backend's own
+      runner.
 - [ ] Optional: `vramctl split <model> --gpu N` as a non-interactive subcommand.
       Only the TUI `s` key does this today.
+- [ ] Per-endpoint failure backoff: when a host sleeps, each refresh still
+      waits out `request_timeout` on its Ollama endpoints.
+- [ ] nvtop-style extras: utilization history/sparklines, and temperature,
+      power and fan from the same `nvidia-smi` query.
+- [ ] Stopping a remote process (an `other` row, or a remote `llama-server`)
+      would need an SSH `kill`, which is deliberately not wired up.

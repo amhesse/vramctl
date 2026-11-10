@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from vramctl.config import AvailableModel, GPUInfo, LoadedModel, PlacementConfig
+from vramctl.config import (
+    AvailableModel,
+    GPUInfo,
+    LoadedModel,
+    PlacementConfig,
+    ProcessTable,
+)
 
 
 class BackendError(RuntimeError):
@@ -15,14 +21,18 @@ class Backend(Protocol):
     """What ``ClusterManager`` needs from every backend.
 
     ``list_running`` receives the live GPU list so backends that identify
-    models by OS process (llama.cpp, Strata) can attribute VRAM per GPU.
+    models by OS process (llama.cpp, Strata) can attribute VRAM per GPU, plus
+    that machine's process table - which may have been read over SSH, so no
+    backend may assume ``/proc`` is reachable.
     """
 
     name: str
 
     def is_enabled(self) -> bool: ...
 
-    def list_running(self, gpus: list[GPUInfo]) -> list[LoadedModel]: ...
+    def list_running(
+        self, gpus: list[GPUInfo], procs: ProcessTable | None = None
+    ) -> list[LoadedModel]: ...
 
     def list_available(self) -> list[AvailableModel]: ...
 

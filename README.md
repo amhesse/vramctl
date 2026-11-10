@@ -20,7 +20,15 @@ An interactive terminal UI (TUI) for inspecting, loading, unloading, and splitti
    - **`l` (Load)**: Open a modal to pick an available model from Ollama or local model directories, select target GPU(s), and configure the GPU/RAM split.
    - **`s` (Split / Move)**: Reconfigure an active model's GPU assignment or GPU/RAM offload ratio (gracefully unloads and reloads with updated flags).
    - **`u` (Unload)**: Immediately evict the selected model from VRAM/RAM.
-   - **`r` (Refresh)**: Manually refresh GPU, RAM, and runtime state.
+   - **`r` (Refresh)**: Manually refresh GPU, RAM, and runtime state, forcing
+     a re-read of remote machines rather than using the cached reading.
+
+   VRAM held by something that is not a managed model - a game, ComfyUI, a
+   voice server - is listed as an `other` row against the card holding it, so
+   a half-full GPU is never unexplained. Those rows carry a `•` rather than a
+   spread marker, and `u` and `s` refuse them: vramctl can see that memory but
+   not control it. The floor for reporting one is `other_min_mb` (64 MiB by
+   default), which keeps a compositor's few MiB out of the list.
 
 ## Installation & Usage
 
@@ -92,9 +100,12 @@ Notes on nodes:
   that card enumerates as CUDA device 0 *inside* the instance. vramctl then
   sends `main_gpu: 0` and attributes the instance's VRAM to the pinned card
   with no PID correlation. An unpinned endpoint keeps the physical index.
-- `llamacpp` and `strata` read `/proc`, so they are honoured on local nodes
-  only. A remote machine contributes its GPU/RAM readings and its Ollama
-  endpoints.
+- `llamacpp` and `strata` are **detected** on any node, local or remote: a
+  node's process table is read with `ps` over the same SSH call as its GPU and
+  RAM figures. Starting and stopping them still needs the process to be local,
+  and the on-disk model catalogues are local too.
+- A remote probe is a single SSH invocation whose sections are split on a
+  sentinel, so a refresh costs one round trip rather than four.
 
 `VRAMCTL_OLLAMA_URL`, `VRAMCTL_STRATA_URL`, `VRAMCTL_LLAMA_SERVER`,
 `VRAMCTL_STRATA_BIN`, and `VRAMCTL_GGUF_DIRS` (`:`-separated) override the

@@ -32,8 +32,9 @@ from vramctl.config import (
     GPUInfo,
     LoadedModel,
     PlacementConfig,
+    ProcInfo,
+    ProcessTable,
 )
-from vramctl.nvidia import process_ram_mb
 
 MODEL_SUFFIXES = (".safetensors", ".gguf", ".strata")
 
@@ -41,10 +42,12 @@ MODEL_SUFFIXES = (".safetensors", ".gguf", ".strata")
 class StrataBackend:
     name = STRATA
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, node: str = "", local: bool = True) -> None:
         self.config = config
         self.base_url = config.strata_url
         self.timeout = config.request_timeout
+        self.node = node
+        self.local = local
 
     def is_enabled(self) -> bool:
         return self.config.strata_enabled
@@ -55,27 +58,36 @@ class StrataBackend:
         """Raw ``/v1/status``. Raises BackendError if Strata is not there."""
         return self._get(self.config.strata_status_path)
 
-    def list_running(self, gpus: list[GPUInfo]) -> list[LoadedModel]:
-        return self.detect_models(gpus)
+    def list_running(
+        self, gpus: list[GPUInfo], procs: ProcessTable | None = None
+    ) -> list[LoadedModel]:
+        return self.detect_models(gpus, procs)
 
-    def detect_models(self, gpus: list[GPUInfo]) -> list[LoadedModel]:
+    def detect_models(
+        self, gpus: list[GPUInfo], procs: ProcessTable | None = None
+    ) -> list[LoadedModel]:
         """The single model Strata currently holds, measured against hardware.
 
         Returns an empty list when Strata is unreachable or idle - an absent
         server is a normal state here, not an error worth surfacing.
         """
 
+        if procs is None:
+            from vramctl.probe import local_process_table
+
+            procs = local_process_table(self.node)
+
         try:
             status = self.status()
         except BackendError:
             # Nothing answering. A Strata process may still be starting up, so
             # fall back to pure process detection rather than reporting nothing.
-            return self._models_from_processes(gpus)
+            return self._models_from_processes(gpus, procs)
 
         if not status.get("loaded", True):
             return []
 
-        pid = self._server_pid()
+        pid = self._server_pid(procs)
         per_gpu = self._vram_for_pid(gpus, pid)
         name = status.get("model") or "(unnamed)"
 
@@ -94,36 +106,38 @@ class StrataBackend:
                 placement=PlacementConfig(gpu_ids=sorted(per_gpu)),
                 pid=pid,
                 vram_mb_per_gpu=per_gpu,
-                ram_mb=process_ram_mb(pid) if pid else 0,
+                ram_mb=procs.rss_mb(pid),
                 size_mb=0,
                 detail=detail or str(status.get("service") or "strata"),
+                node=self.node,
             )
         ]
 
-    def _models_from_processes(self, gpus: list[GPUInfo]) -> list[LoadedModel]:
+    def _models_from_processes(
+        self, gpus: list[GPUInfo], procs: ProcessTable
+    ) -> list[LoadedModel]:
         """Report a Strata process that holds GPU memory but answers nothing."""
         models: list[LoadedModel] = []
-        for pid in _strata_pids():
-            per_gpu = self._vram_for_pid(gpus, pid)
+        for proc in procs.matching(_is_strata):
+            per_gpu = self._vram_for_pid(gpus, proc.pid)
             if not per_gpu:
                 # Idle and silent; nothing measurable to show.
                 continue
-            try:
-                cmdline = psutil.Process(pid).cmdline()
-            except (psutil.Error, OSError):
-                cmdline = []
-            model_arg = next((a for a in cmdline if a.endswith(MODEL_SUFFIXES)), None)
+            model_arg = next(
+                (a for a in proc.cmdline if a.endswith(MODEL_SUFFIXES)), None
+            )
             models.append(
                 LoadedModel(
                     backend=self.name,
-                    name=Path(model_arg).stem if model_arg else f"strata pid {pid}",
-                    handle=model_arg or str(pid),
+                    name=Path(model_arg).stem if model_arg else f"strata pid {proc.pid}",
+                    handle=model_arg or str(proc.pid),
                     placement=PlacementConfig(gpu_ids=sorted(per_gpu)),
-                    pid=pid,
+                    pid=proc.pid,
                     vram_mb_per_gpu=per_gpu,
-                    ram_mb=process_ram_mb(pid),
+                    ram_mb=proc.rss_mb,
                     size_mb=0,
                     detail="process-detected (status endpoint silent)",
+                    node=self.node,
                 )
             )
         return models
@@ -133,13 +147,14 @@ class StrataBackend:
             return {}
         return {gpu.index: gpu.pids[pid] for gpu in gpus if pid in gpu.pids}
 
-    def _server_pid(self) -> int | None:
+    def _server_pid(self, procs: ProcessTable) -> int | None:
         """The pid listening on Strata's port, falling back to a name scan.
 
-        Matching on the port is exact; the name scan only guesses.
+        Matching on the listening port is exact, but the socket table is only
+        readable locally, so a remote node falls back to the name scan.
         """
         port = _port_of(self.base_url)
-        if port is not None:
+        if port is not None and not procs.remote:
             try:
                 for conn in psutil.net_connections(kind="inet"):
                     if (
@@ -151,16 +166,19 @@ class StrataBackend:
                         return conn.pid
             except (psutil.AccessDenied, psutil.Error, OSError):
                 pass
-        return next(iter(_strata_pids()), None)
+        matches = procs.matching(_is_strata)
+        return matches[0].pid if matches else None
 
     def list_available(self) -> list[AvailableModel]:
         """What Strata could serve.
+
+        Local only: the on-disk catalogue is read from this filesystem.
 
         Empty while the backend is observe-only: offering a model in the load
         modal that ``load()`` would then refuse is just noise. Configure
         ``strata_load_path`` and the on-disk catalogue appears.
         """
-        if not self.config.strata_load_path:
+        if not self.config.strata_load_path or not self.local:
             return []
         return self.discover_strata_models()
 
@@ -245,18 +263,8 @@ class StrataBackend:
             return {}
 
 
-def _strata_pids() -> list[int]:
-    pids: list[int] = []
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            cmdline = proc.info["cmdline"] or []
-            name = (proc.info.get("name") or "").lower()
-        except (psutil.Error, OSError):
-            continue
-        exe = Path(cmdline[0]).name.lower() if cmdline else ""
-        if "strata" in name or "strata" in exe:
-            pids.append(proc.info["pid"])
-    return sorted(pids)
+def _is_strata(proc: ProcInfo) -> bool:
+    return "strata" in proc.exe_name.lower()
 
 
 def _port_of(base_url: str) -> int | None:
