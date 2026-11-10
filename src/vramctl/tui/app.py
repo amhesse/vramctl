@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from rich.markup import escape
+
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -14,7 +16,6 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
-    ProgressBar,
     Static,
 )
 
@@ -53,6 +54,46 @@ def _sparkline(samples: list[int], width: int = 24) -> str:
     return "".join(out)
 
 
+# Distinct, stable colours for models sharing a card. Chosen so neighbouring
+# segments stay distinguishable in both light and dark terminals.
+MODEL_COLORS = ("cyan", "magenta", "green", "yellow", "blue", "bright_cyan")
+OTHER_COLOR = "bright_black"
+
+
+def _model_color(name: str) -> str:
+    """A colour that stays with a model across refreshes and restarts."""
+    return MODEL_COLORS[sum(name.encode()) % len(MODEL_COLORS)]
+
+
+def _meter(segments: list[tuple[int, str]], total: int, width: int) -> str:
+    """A proportional bar: one coloured run per segment, then free space.
+
+    Cells are placed from a running total rather than rounded individually,
+    so the segments cannot drift past the bar's width.
+    """
+    if total <= 0 or width <= 0:
+        return ""
+    out: list[str] = []
+    cumulative = 0
+    filled = 0
+    for mb, color in segments:
+        if mb <= 0:
+            continue
+        cumulative += mb
+        edge = min(width, round(width * cumulative / total))
+        cells = edge - filled
+        # Something resident should never render as nothing at all.
+        if cells <= 0 and filled < width:
+            cells = 1
+            edge = filled + 1
+        if cells > 0:
+            out.append(f"[{color}]{'\u2588' * cells}[/]")
+            filled = edge
+    if filled < width:
+        out.append(f"[dim]{'\u2591' * (width - filled)}[/]")
+    return "".join(out)
+
+
 def _slug(name: str) -> str:
     """A DOM-id-safe form of a machine name."""
     return "".join(c if c.isalnum() else "-" for c in name) or "node"
@@ -73,15 +114,25 @@ class GpuCard(Static):
         padding: 0 1;
         margin: 0 1 1 0;
         width: 1fr;
+        /* A node with one GPU would otherwise stretch its card across the
+           terminal, stranding a very long bar beside two short ones. */
+        max-width: 72;
         height: auto;
         min-height: 7;
     }
     GpuCard:focus { border: round $accent; }
     GpuCard .gpu-title { text-style: bold; }
-    GpuCard .gpu-mem { color: $text-muted; }
+    GpuCard .gpu-meter { color: $text; }
+    GpuCard .gpu-legend { color: $text-muted; }
     GpuCard .gpu-trend { color: $text-muted; }
-    GpuCard .gpu-model-list { color: $text-muted; }
     """
+
+    # Room for the "VRAM "/"util " prefix and the trailing " 100%".
+    GUTTER = 10
+    MIN_BAR = 10
+    # A fixed allowance for the sensor readout, so cards whose sensor strings
+    # differ in length still line their meters up with each other.
+    SENSOR_BUDGET = 26
 
     def __init__(
         self,
@@ -92,18 +143,44 @@ class GpuCard(Static):
         super().__init__()
         self.gpu = gpu
         self._title = Label(classes="gpu-title")
-        self._mem = Label(classes="gpu-mem")
-        self._bar = ProgressBar(total=100, show_eta=False, show_percentage=True)
+        self._vram = Label(classes="gpu-meter")
+        self._legend = Label(classes="gpu-legend")
         self._trend = Label(classes="gpu-trend")
-        self._models = Label(classes="gpu-model-list")
+        self._last: tuple = (gpu, models, series)
         self.set_state(gpu, models, series)
 
     def compose(self) -> ComposeResult:
         yield self._title
-        yield self._mem
-        yield self._bar
+        yield self._vram
+        yield self._legend
         yield self._trend
-        yield self._models
+
+    def on_resize(self) -> None:
+        """Re-draw at the new width; the bars are sized to the card."""
+        self.set_state(*self._last)
+
+    @property
+    def _card_width(self) -> int:
+        return self.content_size.width or 44
+
+    def _meter_width(self, sensors: str = "") -> int:
+        """One width for both meters, so their readings share a column.
+
+        The sensors sit to the right of the utilization bar, so they set the
+        width for the VRAM bar too rather than letting the two drift apart.
+        """
+        spare = self._card_width - self.GUTTER
+        if sensors:
+            spare -= max(self.SENSOR_BUDGET, len(sensors)) + 3
+        return max(self.MIN_BAR, spare)
+
+    def _title_text(self, gpu: GPUInfo, stats: list[str]) -> str:
+        """Fit the figures beside the name, dropping detail as space runs out."""
+        base = f"GPU {gpu.index}  {gpu.short_name}"
+        for text in stats:
+            if len(base) + 4 + len(text) <= self._card_width:
+                return f"{base}    {text}"
+        return base
 
     def set_state(
         self,
@@ -112,42 +189,92 @@ class GpuCard(Static):
         series: list[int] | None = None,
     ) -> None:
         self.gpu = gpu
-        self._title.update(f"GPU {gpu.index}  {gpu.short_name}")
+        self._last = (gpu, models, series)
+        sensors = "" if gpu.declared else gpu.sensors
+        width = self._meter_width(sensors)
+
+        held = [
+            (m, m.vram_mb_per_gpu.get(gpu.index, 0))
+            for m in models
+            if m.vram_mb_per_gpu.get(gpu.index, 0) > 0
+        ]
+        held.sort(key=lambda pair: -pair[1])
+
         if gpu.declared:
-            # Nothing was measured, so only what the backends admit to holding
-            # is real. Saying "declared" beats implying a reading.
-            held = sum(m.vram_mb_per_gpu.get(gpu.index, 0) for m in models)
-            self._mem.update(
-                f"{_gb(held)} held / {_gb(gpu.memory_total_mb)} declared"
-                "   util unknown"
+            # Nothing was measured, so the only real figure is what the
+            # backends admit to holding.
+            total = gpu.memory_total_mb
+            by_models = sum(mb for _, mb in held)
+            self._title.update(
+                self._title_text(
+                    gpu,
+                    [
+                        f"{_gb(by_models)} held / {_gb(total)} declared",
+                        f"{_gb(by_models)}/{_gb(total)}",
+                    ],
+                )
             )
-            self._bar.update(
-                progress=round(100 * held / gpu.memory_total_mb)
-                if gpu.memory_total_mb
-                else 0
-            )
+            segments = [(mb, _model_color(m.name)) for m, mb in held]
+            pct = round(100 * by_models / total) if total else 0
+            self._vram.update(f"VRAM {_meter(segments, total, width)} {pct:>3}%")
+            self._trend.update("[dim]util unknown (host not measured)[/]")
         else:
-            self._mem.update(
-                f"{_gb(gpu.memory_used_mb)} / {_gb(gpu.memory_total_mb)} VRAM"
-                f"   {gpu.utilization_pct}% util"
+            total = gpu.memory_total_mb
+            used = gpu.memory_used_mb
+            # Whatever holds VRAM but is not a model we can name: a compositor,
+            # a game, someone else's process. Showing it beats a silent gap
+            # between the model sizes and the card's real usage.
+            other = max(0, used - sum(mb for _, mb in held))
+            self._title.update(
+                self._title_text(
+                    gpu,
+                    [
+                        f"{_gb(used)} / {_gb(total)}  ({_gb(gpu.memory_free_mb)} free)",
+                        f"{_gb(used)} / {_gb(total)}",
+                        f"{_gb(gpu.memory_free_mb)} free",
+                    ],
+                )
             )
-            self._bar.update(progress=round(gpu.used_fraction * 100))
+            segments = [(mb, _model_color(m.name)) for m, mb in held]
+            if other > 0:
+                segments.append((other, OTHER_COLOR))
+            pct = round(gpu.used_fraction * 100)
+            self._vram.update(f"VRAM {_meter(segments, total, width)} {pct:>3}%")
 
-        spark = _sparkline(series or [])
-        sensors = gpu.sensors
-        if spark and sensors:
-            self._trend.update(f"{spark}  {sensors}")
-        else:
-            self._trend.update(spark or sensors or "")
+            samples = (series or [])[-width:]
+            spark = _sparkline(samples, width)
+            # Pad the unfilled part of the window so the reading does not
+            # slide left as samples accumulate.
+            pad = max(0, width - len(samples))
+            graph = (f"[dim]{'\u00b7' * pad}[/]" if pad else "") + spark
+            trend = f"util {graph} {gpu.utilization_pct:>3}%"
+            if sensors:
+                trend += f"   [dim]{sensors}[/]"
+            self._trend.update(trend)
 
-        if models:
-            lines = "\n".join(
-                f"  \u2022 {m.name}  {_gb(m.vram_mb_per_gpu.get(gpu.index, 0))}"
-                for m in models
-            )
-        else:
-            lines = "  (idle)"
-        self._models.update(lines)
+        self._legend.update(self._legend_text(held, gpu))
+
+    def _legend_text(self, held: list, gpu: GPUInfo) -> str:
+        """Name each coloured run, so the bar is readable without a key."""
+        lines = []
+        for model, mb in held[:3]:
+            swatch = f"[{_model_color(model.name)}]\u25a0[/]"
+            lines.append(f"  {swatch} {escape(model.name)}  {_gb(mb)}")
+        if len(held) > 3:
+            rest = sum(mb for _, mb in held[3:])
+            lines.append(f"  [dim]+{len(held) - 3} more  {_gb(rest)}[/]")
+        if not gpu.declared:
+            other = max(0, gpu.memory_used_mb - sum(mb for _, mb in held))
+            if other > 0:
+                # A card can be busy with things that are not models at all;
+                # calling that "idle" is what made the bar look wrong.
+                lines.append(
+                    f"  [{OTHER_COLOR}]\u25a0[/] [dim]other processes  "
+                    f"{_gb(other)}[/]"
+                )
+        if not lines:
+            return "  [dim](idle)[/]"
+        return "\n".join(lines)
 
 
 class ModelRow(ListItem):
