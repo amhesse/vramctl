@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from rich.markup import escape
 
 from textual import work
+from textual.color import Color
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -102,6 +105,133 @@ MODEL_COLORS = ("cyan", "magenta", "green", "yellow", "blue", "bright_cyan")
 OTHER_COLOR = "bright_black"
 
 
+@dataclass
+class Paint:
+    """Colours resolved once per render and shared by every widget.
+
+    The cards and the model list must agree, or a legend swatch would not
+    match the bar segment it names.
+    """
+
+    model: dict[str, str] = field(default_factory=dict)
+    muted: str = OTHER_COLOR
+    fallback: tuple[str, ...] = MODEL_COLORS
+
+    def for_model(self, model: LoadedModel) -> str:
+        """The colour of a model's segment, or muted if it occupies no VRAM."""
+        if not model.vram_mb:
+            # Nothing on any bar to match, so a bright tag would be a promise
+            # the cards cannot keep.
+            return self.muted
+        return self.model.get(model.key) or _model_color(model.name, self.fallback)
+
+
+def _markup_color(value: str, fallback: str = "") -> str:
+    """Normalise a theme colour into something terminal markup accepts.
+
+    The ANSI themes report names like ``ansi_blue`` and ``ansi_default``
+    instead of hex. Markup understands neither, so the prefix is dropped -
+    leaving ``blue``, which it does understand - and ``default``, which names
+    no colour at all, falls back.
+    """
+    if not value:
+        return fallback
+    if value.startswith("#"):
+        return value
+    name = value.removeprefix("ansi_")
+    if name in ("default", ""):
+        return fallback
+    return name
+
+
+def expand_palette(bases: tuple[str, ...], needed: int) -> tuple[str, ...]:
+    """Grow a theme's few accents into enough distinct colours.
+
+    Variants are appended tier by tier, so the most distinguishable colours
+    are always used first and shades only appear once they are needed.
+    """
+    if not bases:
+        bases = MODEL_COLORS
+    palette = list(bases)
+    if needed <= len(palette):
+        return tuple(palette)
+    for factor in (0.3, -0.3, 0.55):
+        for base in bases:
+            # Only hex can be shaded; an ANSI colour has no numeric value to
+            # lighten, so those themes simply reuse their base colours.
+            if not base.startswith("#"):
+                continue
+            try:
+                color = Color.parse(base)
+                shade = (
+                    color.lighten(factor) if factor > 0 else color.darken(-factor)
+                )
+                hexed = shade.hex
+            except Exception:
+                continue
+            if not hexed.startswith("#") or hexed in palette:
+                continue
+            palette.append(hexed)
+            if len(palette) >= needed:
+                return tuple(palette)
+    return tuple(palette)
+
+
+def assign_model_colors(
+    models: list[LoadedModel], palette: tuple[str, ...]
+) -> dict[str, str]:
+    """Give every model its own colour, preferring a stable one.
+
+    The name picks a colour, so a model keeps it across refreshes and
+    restarts. When two names want the same slot the later one steps to the
+    next free colour rather than sharing, because two segments in one colour
+    would be unreadable. Models are walked in a fixed order so the outcome
+    does not depend on the order a refresh happened to collect them in.
+    """
+    if not palette:
+        return {}
+    out: dict[str, str] = {}
+    taken: set[int] = set()
+    for model in sorted(models, key=lambda m: m.key):
+        preferred = sum(model.name.encode()) % len(palette)
+        index = preferred
+        for step in range(len(palette)):
+            candidate = (preferred + step) % len(palette)
+            if candidate not in taken:
+                index = candidate
+                break
+        else:
+            # More models than colours: start reusing rather than drop one.
+            taken.clear()
+            index = preferred
+        taken.add(index)
+        out[model.key] = palette[index]
+    return out
+
+
+def muted_color(app) -> str:
+    """A theme-derived tone for VRAM that belongs to no model we can name.
+
+    Previously a hardcoded ``bright_black``, which stayed the same grey in
+    every one of the 21 themes while everything beside it changed.
+    """
+    try:
+        theme = app.available_themes.get(app.theme)
+        if theme is None:
+            return OTHER_COLOR
+        foreground = _markup_color(theme.foreground)
+        background = _markup_color(theme.background)
+        # An ANSI theme gives no numeric colours to blend between.
+        if not (foreground.startswith("#") and background.startswith("#")):
+            return OTHER_COLOR
+        blended = (
+            Color.parse(foreground).blend(Color.parse(background), 0.55).hex
+        )
+        return blended if blended.startswith("#") else OTHER_COLOR
+    except Exception:
+        return OTHER_COLOR
+
+
 def _model_color(name: str, palette: tuple[str, ...] = MODEL_COLORS) -> str:
     """A colour that stays with a model across refreshes and restarts."""
     if not palette:
@@ -120,7 +250,11 @@ def _theme_swatch(theme) -> str:
         getattr(theme, "warning", ""),
         getattr(theme, "error", ""),
     )
-    return "".join(f"[{c}]\u2588\u2588[/]" for c in picks if c)
+    return "".join(
+        f"[{color}]\u2588\u2588[/]"
+        for color in (_markup_color(p or "") for p in picks)
+        if color
+    )
 
 
 def theme_palette(app) -> tuple[str, ...]:
@@ -141,7 +275,12 @@ def theme_palette(app) -> tuple[str, ...]:
         theme.warning,
         theme.secondary,
     )
-    return tuple(p for p in picks if p) or MODEL_COLORS
+    usable = []
+    for pick in picks:
+        color = _markup_color(pick or "")
+        if color and color not in usable:
+            usable.append(color)
+    return tuple(usable) or MODEL_COLORS
 
 
 def _meter(segments: list[tuple[int, str]], total: int, width: int) -> str:
@@ -218,18 +357,18 @@ class GpuCard(Static):
         gpu: GPUInfo,
         models: list[LoadedModel],
         series: list[int] | None = None,
-        palette: tuple[str, ...] = MODEL_COLORS,
+        paint: Paint | None = None,
         height: int = 3,
     ) -> None:
         super().__init__()
         self.gpu = gpu
-        self._palette = palette or MODEL_COLORS
+        self._paint = paint or Paint()
         self._height = max(1, height)
         self._title = Label(classes="gpu-title")
         self._vram = Label(classes="gpu-meter")
         self._legend = Label(classes="gpu-legend")
         self._trend = Label(classes="gpu-trend")
-        self._last: tuple = (gpu, models, series, self._palette, self._height)
+        self._last: tuple = (gpu, models, series, self._paint, self._height)
         self.set_state(gpu, models, series)
 
     def compose(self) -> ComposeResult:
@@ -270,15 +409,15 @@ class GpuCard(Static):
         gpu: GPUInfo,
         models: list[LoadedModel],
         series: list[int] | None = None,
-        palette: tuple[str, ...] | None = None,
+        paint: Paint | None = None,
         height: int | None = None,
     ) -> None:
         self.gpu = gpu
-        if palette:
-            self._palette = palette
+        if paint is not None:
+            self._paint = paint
         if height:
             self._height = max(1, height)
-        self._last = (gpu, models, series, self._palette, self._height)
+        self._last = (gpu, models, series, self._paint, self._height)
         sensors = "" if gpu.declared else gpu.sensors
         width = self._meter_width(sensors)
 
@@ -303,7 +442,7 @@ class GpuCard(Static):
                     ],
                 )
             )
-            segments = [(mb, _model_color(m.name, self._palette)) for m, mb in held]
+            segments = [(mb, self._paint.for_model(m)) for m, mb in held]
             pct = round(100 * by_models / total) if total else 0
             bar = _meter(segments, total, width)
             self._vram.update(
@@ -327,9 +466,9 @@ class GpuCard(Static):
                     ],
                 )
             )
-            segments = [(mb, _model_color(m.name, self._palette)) for m, mb in held]
+            segments = [(mb, self._paint.for_model(m)) for m, mb in held]
             if other > 0:
-                segments.append((other, OTHER_COLOR))
+                segments.append((other, self._paint.muted))
             pct = round(gpu.used_fraction * 100)
             bar = _meter(segments, total, width)
             self._vram.update(
@@ -361,7 +500,7 @@ class GpuCard(Static):
         """Name each coloured run, so the bar is readable without a key."""
         lines = []
         for model, mb in held[:3]:
-            swatch = f"[{_model_color(model.name, self._palette)}]\u25a0[/]"
+            swatch = f"[{self._paint.for_model(model)}]\u25a0[/]"
             lines.append(f"  {swatch} {escape(model.name)}  {_gb(mb)}")
         if len(held) > 3:
             rest = sum(mb for _, mb in held[3:])
@@ -372,7 +511,7 @@ class GpuCard(Static):
                 # A card can be busy with things that are not models at all;
                 # calling that "idle" is what made the bar look wrong.
                 lines.append(
-                    f"  [{OTHER_COLOR}]\u25a0[/] [dim]other processes  "
+                    f"  [{self._paint.muted}]\u25a0[/] [dim]other processes  "
                     f"{_gb(other)}[/]"
                 )
         if not lines:
@@ -389,11 +528,12 @@ class ModelRow(ListItem):
     ModelRow .row-sub { color: $text-muted; }
     """
 
-    def __init__(self, model: LoadedModel) -> None:
+    def __init__(self, model: LoadedModel, paint: Paint | None = None) -> None:
         super().__init__()
+        self._paint = paint or Paint()
         self._main = Label(classes="row-main")
         self._sub = Label(classes="row-sub")
-        self.set_model(model)
+        self.set_model(model, paint)
 
     def compose(self) -> ComposeResult:
         yield self._main
@@ -401,8 +541,10 @@ class ModelRow(ListItem):
 
     SPREAD_MARK = {"vram": "\u25b0\u25b0", "split": "\u25b0\u25b1", "ram": "\u25b1\u25b1"}
 
-    def set_model(self, model: LoadedModel) -> None:
+    def set_model(self, model: LoadedModel, paint: Paint | None = None) -> None:
         self.model = model
+        if paint is not None:
+            self._paint = paint
         where = model.location
         pid = f" \u00b7 pid {model.pid}" if model.pid else ""
         detail = f" \u00b7 {model.detail}" if model.detail else ""
@@ -908,9 +1050,9 @@ class ThemePicker(ModalScreen[str | None]):
             ("error", theme.error),
         )
         parts = [
-            f"[{color}]\u2588\u2588[/] [dim]{name}[/]"
+            f"[{_markup_color(color)}]\u2588\u2588[/] [dim]{name}[/]"
             for name, color in roles
-            if color
+            if _markup_color(color or "")
         ]
         self.query_one("#theme-sample", Label).update(
             "Model segments use: " + "  ".join(parts[:5]) + "\n"
@@ -998,12 +1140,15 @@ class VramctlApp(App[None]):
 
     def rerender(self) -> None:
         """Redraw from the last known state, e.g. after a theme or size change."""
-        palette = theme_palette(self)
+        state = self.manager.state
+        paint = self._paint_for(state)
         for card in self._cards.values():
             gpu, models, series, _, _ = card._last
             card.set_state(
-                gpu, models, series, palette=palette, height=self.graph_height
+                gpu, models, series, paint=paint, height=self.graph_height
             )
+        for row in self.query(ModelRow):
+            row.set_model(row.model, paint)
 
     MAX_GRAPH_HEIGHT = 8
 
@@ -1053,9 +1198,20 @@ class VramctlApp(App[None]):
         state = self.manager.refresh_state(force_telemetry=force)
         self.call_from_thread(self._render, state)
 
+    def _paint_for(self, state: ClusterState) -> Paint:
+        """Resolve every colour for one pass, so cards and rows agree."""
+        bases = theme_palette(self)
+        palette = expand_palette(bases, len(state.models))
+        return Paint(
+            model=assign_model_colors(state.models, palette),
+            muted=muted_color(self),
+            fallback=bases,
+        )
+
     def _render(self, state: ClusterState) -> None:
-        self._render_nodes(state)
-        self._render_models(state)
+        paint = self._paint_for(state)
+        self._render_nodes(state, paint)
+        self._render_models(state, paint)
 
         status = self.query_one("#status", Label)
         if state.errors:
@@ -1083,7 +1239,7 @@ class VramctlApp(App[None]):
             bits.append("\u26a0 unreachable, showing declared capacity")
         return "  \u00b7  ".join(bits)
 
-    def _render_nodes(self, state: ClusterState) -> None:
+    def _render_nodes(self, state: ClusterState, paint: Paint) -> None:
         """Render one section per machine, remounting only if the shape changed."""
         container = self.query_one("#nodes", Vertical)
         shape = [(n.name, tuple(g.index for g in n.gpus)) for n in state.nodes]
@@ -1100,7 +1256,7 @@ class VramctlApp(App[None]):
                             gpu,
                             state.models_on_gpu(node.name, gpu.index),
                             self.manager.series_for(node.name, gpu.index),
-                            palette=theme_palette(self),
+                            paint=paint,
                             height=self.graph_height,
                         )
             return
@@ -1128,7 +1284,7 @@ class VramctlApp(App[None]):
                     gpu,
                     state.models_on_gpu(node.name, gpu.index),
                     self.manager.series_for(node.name, gpu.index),
-                    palette=theme_palette(self),
+                    paint=paint,
                     height=self.graph_height,
                 )
                 self._cards[(node.name, gpu.index)] = card
@@ -1136,7 +1292,7 @@ class VramctlApp(App[None]):
             row.mount_all(cards)
         self._node_shape = shape
 
-    def _render_models(self, state: ClusterState) -> None:
+    def _render_models(self, state: ClusterState, paint: Paint) -> None:
         """Update the model list, preserving the cursor across refreshes."""
         view = self.query_one("#models", ListView)
         rows = [r for r in view.children if isinstance(r, ModelRow)]
@@ -1144,7 +1300,7 @@ class VramctlApp(App[None]):
 
         if [r.model.key for r in rows] == keys and rows:
             for row, model in zip(rows, state.models):
-                row.set_model(model)
+                row.set_model(model, paint)
             return
 
         selected_key = (
@@ -1154,7 +1310,7 @@ class VramctlApp(App[None]):
         )
         view.clear()
         for model in state.models:
-            view.append(ModelRow(model))
+            view.append(ModelRow(model, paint))
         if state.models:
             view.index = keys.index(selected_key) if selected_key in keys else 0
 
