@@ -14,21 +14,18 @@
 ## Next
 
 - [x] Multi-endpoint `nodes[]` config: one Ollama URL per GPU, with the endpoint
-      as the GPU identity (`:11434` -> 3090 Ti, `:11435` -> 4070 Ti SUPER, both
-      enforced by `DevicePolicy=closed` + a single `DeviceAllow` in each unit's
-      `zz-gpu-pin.conf`).
+      as the GPU identity when an instance is confined to a single card.
 - [x] Fix `OllamaBackend.load()` to send `main_gpu: 0` per endpoint. A physical
       index is wrong: each instance's cgroup exposes exactly one card, which
       enumerates as device 0 inside the service.
 - [x] Drop the `_attribute_vram()` PID heuristic for endpoint-pinned instances;
       the endpoint already identifies the GPU exactly.
-- [x] SSH telemetry for `katana-laptop` (192.168.157.49, passwordless, user
-      `aaron`), with declared VRAM capacity as the fallback. Short timeout and
-      graceful `unreachable` state, since the laptop sleeps.
-- [x] Blocked, needs Aaron: laptop `nvidia-smi` returns `Failed to initialize
-      NVML: Driver/library version mismatch` (NVML 615.78). Needs a reboot.
-- [ ] Blocked, needs Aaron: Strata's real port (the `8181` default is invented)
-      and its install source - no pacman/pip/docker/dotfile trace remains.
+- [x] SSH telemetry for remote nodes, with declared VRAM capacity as the
+      fallback. Short timeout and a graceful `unreachable` state, since a
+      laptop may be asleep.
+- [ ] Strata: only `/v1/status` is confirmed, so the backend stays
+      observe-only. Its load and unload endpoints are unknown, and the
+      default port is a guess.
 - [x] Remote process detection: read each node's process table with `ps` in
       the same SSH call as its GPU and RAM figures, so a remote `llama-server`
       or Strata instance is visible rather than anonymous VRAM.

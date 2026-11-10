@@ -1,9 +1,9 @@
 """Ollama adapter: one instance per endpoint.
 
-An Ollama instance may be pinned to a single GPU by its systemd unit - on
-InferencePrime each one runs under ``DevicePolicy=closed`` with a single
-``DeviceAllow``, so it can open exactly one card. Two consequences shape this
-adapter:
+An Ollama instance may be pinned to a single GPU by its service definition -
+for example a systemd unit using ``DevicePolicy=closed`` with a single
+``DeviceAllow``, so the process can open exactly one card. Two consequences
+shape this adapter:
 
 * The endpoint *is* the GPU. Everything the instance reports lives on that
   card, so VRAM needs no PID correlation to attribute.

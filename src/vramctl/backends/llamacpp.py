@@ -286,7 +286,11 @@ def _is_ollama_runner(proc: ProcInfo) -> bool:
     if not proc.cmdline:
         return False
     argv0 = proc.cmdline[0]
-    return "/ollama/" in argv0 or Path(argv0).name == "ollama"
+    # Case-folded: the macOS install lives under /Applications/Ollama.app.
+    lowered = argv0.lower()
+    return "/ollama/" in lowered or "ollama.app/" in lowered or (
+        Path(argv0).name.lower() == "ollama"
+    )
 
 
 def _is_llamacpp(proc: ProcInfo) -> bool:

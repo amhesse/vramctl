@@ -385,9 +385,12 @@ class Config:
     llamacpp_base_port: int = 8080
     gguf_dirs: list[str] = field(default_factory=list)
 
-    strata_enabled: bool = True
-    # Strata serves one model at a time and names it on /v1/status. The port
-    # is not yet confirmed for this host, so set it before trusting the panel.
+    # Off unless asked for: Strata is not a public project, so probing for it
+    # on every refresh would be noise on any other machine. Set a node's
+    # "strata" url, or strata_enabled, to turn it on.
+    strata_enabled: bool = False
+    # Strata serves one model at a time and names it on /v1/status. This port
+    # is a guess; confirm it before trusting the panel.
     strata_url: str = "http://127.0.0.1:8181"
     strata_status_path: str = "/v1/status"
     # Strata's load/unload API is unverified; leave these unset and the backend

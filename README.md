@@ -41,12 +41,39 @@ An interactive terminal UI (TUI) for inspecting, loading, unloading, and splitti
    not control it. The floor for reporting one is `other_min_mb` (64 MiB by
    default), which keeps a compositor's few MiB out of the list.
 
+## Requirements
+
+- **Linux** on the machine you run it from. GPU figures come from `nvidia-smi`,
+  and process detection reads `/proc`.
+- **NVIDIA GPUs** with `nvidia-smi` on `PATH`. Without it, vramctl still shows
+  host RAM and whatever the backends report, and says the GPUs were not read.
+- Python 3.10+.
+- Optional: Ollama (any number of instances), a `llama-server` binary, and
+  non-interactive SSH to any other machine you want to watch. Each is used if
+  present and skipped if not.
+
 ## Installation & Usage
 
 ```bash
 pip install -e .
 vramctl
 ```
+
+With no configuration it manages the local machine and one Ollama at
+`localhost:11434`, which is enough for a single-GPU box. To find everything
+else, let it probe:
+
+```bash
+vramctl --init              # print a starter config, with notes on stderr
+vramctl --init --write      # save it to ~/.config/vramctl/config.json
+```
+
+`--init` reads the GPUs, looks for Ollama on ports 11434-11439 **on loopback
+only**, checks whether `llama-server` is on `PATH`, and reports which model
+directories actually hold `.gguf` files. One thing it cannot work out is which
+GPU a pinned Ollama instance is tied to - there is no API for that - so with
+several GPUs and several endpoints it tells you to add `"gpu": <index>`
+yourself.
 
 ### CLI flags
 
@@ -83,19 +110,19 @@ entry is an endpoint, and `gpu` pins it to one card **on that node**:
 {
   "nodes": [
     {
-      "name": "InferencePrime",
+      "name": "workstation",
       "local": true,
       "ollama": [
-        {"url": "http://127.0.0.1:11434", "gpu": 0, "label": "george"},
-        {"url": "http://127.0.0.1:11435", "gpu": 1, "label": "katie"}
+        {"url": "http://127.0.0.1:11434", "gpu": 0, "label": "primary"},
+        {"url": "http://127.0.0.1:11435", "gpu": 1, "label": "secondary"}
       ],
       "llamacpp": true,
       "strata": {"url": "http://127.0.0.1:8181"}
     },
     {
-      "name": "katana-laptop",
-      "ssh": "katana-laptop",
-      "ollama": [{"url": "http://192.168.157.49:11434", "gpu": 0}],
+      "name": "gpu-laptop",
+      "ssh": "gpu-laptop",
+      "ollama": [{"url": "http://10.0.0.42:11434", "gpu": 0}],
       "gpus": [{"index": 0, "name": "RTX 4060 Laptop", "vram_mb": 8188}]
     }
   ],
@@ -116,7 +143,8 @@ Notes on nodes:
   be measured, and such a card is labelled `declared` with no utilization,
   since nothing was actually read.
 - **Pinning `gpu` matters.** When an Ollama instance is confined to one card
-  (on InferencePrime, by `DevicePolicy=closed` plus a single `DeviceAllow`),
+  (for example by `DevicePolicy=closed` plus a single `DeviceAllow`
+  in its systemd unit),
   that card enumerates as CUDA device 0 *inside* the instance. vramctl then
   sends `main_gpu: 0` and attributes the instance's VRAM to the pinned card
   with no PID correlation. An unpinned endpoint keeps the physical index.
