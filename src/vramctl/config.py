@@ -397,6 +397,12 @@ class Config:
     strata_bin: str = "strata"
     strata_dirs: list[str] = field(default_factory=list)
 
+    # Default theme. A theme chosen in the UI is saved separately and wins,
+    # being the more recent explicit choice.
+    theme: str = ""
+    # Rows per bar graph. Taller resolves more detail; the UI can change it.
+    graph_height: int = 3
+
     refresh_seconds: float = 3.0
     request_timeout: float = 10.0
     # Polling must stay responsive, so inspection gets a short deadline while

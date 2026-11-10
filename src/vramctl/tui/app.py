@@ -29,6 +29,7 @@ from vramctl.config import (
     PlacementConfig,
 )
 from vramctl.manager import ClusterManager
+from vramctl.prefs import Prefs, load_prefs, prefs_path, save_prefs
 
 
 def _gb(mb: int) -> str:
@@ -36,6 +37,47 @@ def _gb(mb: int) -> str:
 
 
 SPARK = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+
+
+def _sparkline_block(samples: list[int], width: int, height: int) -> list[str]:
+    """Utilization history as a column chart, newest on the right.
+
+    Each row contributes eight levels, so a three-row block resolves 24 steps
+    instead of the 8 a single row can show - which is what makes a busy card
+    distinguishable from a saturated one.
+    """
+    if height <= 1:
+        return [_sparkline(samples, width)]
+    recent = samples[-width:]
+    levels = height * len(SPARK)
+    rows: list[str] = []
+    for row in range(height):
+        floor = (height - 1 - row) * len(SPARK)
+        cells = []
+        for value in recent:
+            level = min(levels, max(0, round(value / 100 * levels)))
+            cell = level - floor
+            if cell <= 0:
+                cells.append(" ")
+            elif cell >= len(SPARK):
+                cells.append(SPARK[-1])
+            else:
+                cells.append(SPARK[cell - 1])
+        rows.append("".join(cells))
+    return rows
+
+
+def _labelled_block(label: str, rows: list[str], reading: str) -> str:
+    """Stack bar rows, naming the meter and its reading on the centre row."""
+    if not rows:
+        return f"{label:<5}{reading}"
+    centre = (len(rows) - 1) // 2
+    out = []
+    for index, row in enumerate(rows):
+        prefix = f"{label:<5}" if index == centre else " " * 5
+        suffix = reading if index == centre else ""
+        out.append(f"{prefix}{row}{suffix}")
+    return "\n".join(out)
 
 
 def _sparkline(samples: list[int], width: int = 24) -> str:
@@ -60,9 +102,46 @@ MODEL_COLORS = ("cyan", "magenta", "green", "yellow", "blue", "bright_cyan")
 OTHER_COLOR = "bright_black"
 
 
-def _model_color(name: str) -> str:
+def _model_color(name: str, palette: tuple[str, ...] = MODEL_COLORS) -> str:
     """A colour that stays with a model across refreshes and restarts."""
-    return MODEL_COLORS[sum(name.encode()) % len(MODEL_COLORS)]
+    if not palette:
+        palette = MODEL_COLORS
+    return palette[sum(name.encode()) % len(palette)]
+
+
+def _theme_swatch(theme) -> str:
+    """A compact strip of a theme's colours, for the picker list."""
+    picks = (
+        getattr(theme, "background", ""),
+        getattr(theme, "surface", ""),
+        getattr(theme, "primary", ""),
+        getattr(theme, "accent", ""),
+        getattr(theme, "success", ""),
+        getattr(theme, "warning", ""),
+        getattr(theme, "error", ""),
+    )
+    return "".join(f"[{c}]\u2588\u2588[/]" for c in picks if c)
+
+
+def theme_palette(app) -> tuple[str, ...]:
+    """Model colours taken from the active theme, so cards match it.
+
+    ``error`` is left out on purpose: red on a healthy card reads as a fault.
+    """
+    try:
+        theme = app.available_themes.get(app.theme)
+    except Exception:
+        return MODEL_COLORS
+    if theme is None:
+        return MODEL_COLORS
+    picks = (
+        theme.primary,
+        theme.accent,
+        theme.success,
+        theme.warning,
+        theme.secondary,
+    )
+    return tuple(p for p in picks if p) or MODEL_COLORS
 
 
 def _meter(segments: list[tuple[int, str]], total: int, width: int) -> str:
@@ -139,14 +218,18 @@ class GpuCard(Static):
         gpu: GPUInfo,
         models: list[LoadedModel],
         series: list[int] | None = None,
+        palette: tuple[str, ...] = MODEL_COLORS,
+        height: int = 3,
     ) -> None:
         super().__init__()
         self.gpu = gpu
+        self._palette = palette or MODEL_COLORS
+        self._height = max(1, height)
         self._title = Label(classes="gpu-title")
         self._vram = Label(classes="gpu-meter")
         self._legend = Label(classes="gpu-legend")
         self._trend = Label(classes="gpu-trend")
-        self._last: tuple = (gpu, models, series)
+        self._last: tuple = (gpu, models, series, self._palette, self._height)
         self.set_state(gpu, models, series)
 
     def compose(self) -> ComposeResult:
@@ -187,9 +270,15 @@ class GpuCard(Static):
         gpu: GPUInfo,
         models: list[LoadedModel],
         series: list[int] | None = None,
+        palette: tuple[str, ...] | None = None,
+        height: int | None = None,
     ) -> None:
         self.gpu = gpu
-        self._last = (gpu, models, series)
+        if palette:
+            self._palette = palette
+        if height:
+            self._height = max(1, height)
+        self._last = (gpu, models, series, self._palette, self._height)
         sensors = "" if gpu.declared else gpu.sensors
         width = self._meter_width(sensors)
 
@@ -214,9 +303,12 @@ class GpuCard(Static):
                     ],
                 )
             )
-            segments = [(mb, _model_color(m.name)) for m, mb in held]
+            segments = [(mb, _model_color(m.name, self._palette)) for m, mb in held]
             pct = round(100 * by_models / total) if total else 0
-            self._vram.update(f"VRAM {_meter(segments, total, width)} {pct:>3}%")
+            bar = _meter(segments, total, width)
+            self._vram.update(
+                _labelled_block("VRAM", [bar] * self._height, f" {pct:>3}%")
+            )
             self._trend.update("[dim]util unknown (host not measured)[/]")
         else:
             total = gpu.memory_total_mb
@@ -235,22 +327,33 @@ class GpuCard(Static):
                     ],
                 )
             )
-            segments = [(mb, _model_color(m.name)) for m, mb in held]
+            segments = [(mb, _model_color(m.name, self._palette)) for m, mb in held]
             if other > 0:
                 segments.append((other, OTHER_COLOR))
             pct = round(gpu.used_fraction * 100)
-            self._vram.update(f"VRAM {_meter(segments, total, width)} {pct:>3}%")
+            bar = _meter(segments, total, width)
+            self._vram.update(
+                _labelled_block("VRAM", [bar] * self._height, f" {pct:>3}%")
+            )
 
             samples = (series or [])[-width:]
-            spark = _sparkline(samples, width)
+            rows = _sparkline_block(samples, width, self._height)
             # Pad the unfilled part of the window so the reading does not
-            # slide left as samples accumulate.
+            # slide left as samples accumulate. Only the floor is marked, so
+            # the empty rows above stay quiet.
             pad = max(0, width - len(samples))
-            graph = (f"[dim]{'\u00b7' * pad}[/]" if pad else "") + spark
-            trend = f"util {graph} {gpu.utilization_pct:>3}%"
+            if pad:
+                for index in range(len(rows)):
+                    filler = (
+                        f"[dim]{'\u00b7' * pad}[/]"
+                        if index == len(rows) - 1
+                        else " " * pad
+                    )
+                    rows[index] = filler + rows[index]
+            reading = f" {gpu.utilization_pct:>3}%"
             if sensors:
-                trend += f"   [dim]{sensors}[/]"
-            self._trend.update(trend)
+                reading += f"   [dim]{sensors}[/]"
+            self._trend.update(_labelled_block("util", rows, reading))
 
         self._legend.update(self._legend_text(held, gpu))
 
@@ -258,7 +361,7 @@ class GpuCard(Static):
         """Name each coloured run, so the bar is readable without a key."""
         lines = []
         for model, mb in held[:3]:
-            swatch = f"[{_model_color(model.name)}]\u25a0[/]"
+            swatch = f"[{_model_color(model.name, self._palette)}]\u25a0[/]"
             lines.append(f"  {swatch} {escape(model.name)}  {_gb(mb)}")
         if len(held) > 3:
             rest = sum(mb for _, mb in held[3:])
@@ -699,6 +802,130 @@ class ConfirmStopModal(ModalScreen[bool]):
         self.dismiss(True)
 
 
+class ThemeItem(ListItem):
+    """A theme name beside a strip of its own colours."""
+
+    def __init__(self, name: str, theme) -> None:
+        super().__init__()
+        self.theme_name = name
+        self._palette_theme = theme
+        self._label = Label()
+        self._label.update(self._row_text())
+
+    def compose(self) -> ComposeResult:
+        yield self._label
+
+    def _row_text(self) -> str:
+        # Not named _render: Widget._render is part of Textual's rendering
+        # pipeline and must return a Visual, so overriding it with a str
+        # breaks the widget.
+        swatch = _theme_swatch(self._palette_theme)
+        kind = "dark " if getattr(self._palette_theme, "dark", True) else "light"
+        return f"{swatch}  {escape(self.theme_name):<22} [dim]{kind}[/]"
+
+
+class ThemePicker(ModalScreen[str | None]):
+    """Pick a theme, previewing each one on the real UI as the cursor moves.
+
+    Moving the cursor applies the theme immediately, so the preview *is* the
+    application rather than a mock of it. Cancelling restores whatever was
+    active on entry.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    ThemePicker { align: center middle; }
+    #theme-box {
+        width: 72;
+        max-width: 90%;
+        height: auto;
+        max-height: 85%;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #theme-title { text-style: bold; margin-bottom: 1; }
+    #theme-list { height: 16; border: round $panel-lighten-2; }
+    #theme-sample { margin-top: 1; }
+    .theme-hint { color: $text-muted; }
+    """
+
+    def __init__(self, current: str) -> None:
+        super().__init__()
+        self.current = current
+        # Restored if the user backs out, so previewing is never destructive.
+        self.original = current
+
+    def compose(self) -> ComposeResult:
+        themes = self.app.available_themes
+        with Vertical(id="theme-box"):
+            yield Label("Theme", id="theme-title")
+            yield ListView(
+                *[ThemeItem(name, theme) for name, theme in themes.items()],
+                id="theme-list",
+            )
+            yield Label(id="theme-sample")
+            yield Label(
+                "\u2191/\u2193 previews live \u00b7 enter keeps it \u00b7 esc restores",
+                classes="theme-hint",
+            )
+
+    def on_mount(self) -> None:
+        view = self.query_one("#theme-list", ListView)
+        names = [item.theme_name for item in view.query(ThemeItem)]
+        if self.current in names:
+            view.index = names.index(self.current)
+        view.focus()
+        self._render_sample()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        item = event.item
+        if not isinstance(item, ThemeItem):
+            return
+        self.current = item.theme_name
+        self.app.theme = item.theme_name
+        # Cards colour their segments from the theme, so they have to redraw.
+        self.app.rerender()
+        self._render_sample()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.action_confirm()
+
+    def _render_sample(self) -> None:
+        """Show the roles the cards actually use, named."""
+        theme = self.app.available_themes.get(self.current)
+        if theme is None:
+            return
+        roles = (
+            ("primary", theme.primary),
+            ("accent", theme.accent),
+            ("success", theme.success),
+            ("warning", theme.warning),
+            ("secondary", theme.secondary),
+            ("error", theme.error),
+        )
+        parts = [
+            f"[{color}]\u2588\u2588[/] [dim]{name}[/]"
+            for name, color in roles
+            if color
+        ]
+        self.query_one("#theme-sample", Label).update(
+            "Model segments use: " + "  ".join(parts[:5]) + "\n"
+            + "[dim]error is reserved for faults, never for a model.[/]"
+        )
+
+    def action_confirm(self) -> None:
+        self.dismiss(self.current)
+
+    def action_cancel(self) -> None:
+        self.app.theme = self.original
+        self.app.rerender()
+        self.dismiss(None)
+
+
 class VramctlApp(App[None]):
     """Arrow-key dashboard over GPUs, RAM, and loaded models."""
 
@@ -721,6 +948,9 @@ class VramctlApp(App[None]):
         Binding("u", "unload", "Unload"),
         Binding("k", "stop_process", "Stop proc"),
         Binding("r", "refresh", "Refresh"),
+        Binding("t", "theme", "Theme"),
+        Binding("plus,equals_sign,equal", "taller", "Taller", show=False),
+        Binding("minus,underscore", "shorter", "Shorter", show=False),
         Binding("left", "focus_prev_gpu", "Prev GPU", show=False),
         Binding("right", "focus_next_gpu", "Next GPU", show=False),
         Binding("q", "quit", "Quit"),
@@ -734,6 +964,10 @@ class VramctlApp(App[None]):
         # them every tick would drop keyboard focus mid-poll.
         self._cards: dict[tuple[str, int], GpuCard] = {}
         self._node_shape: list = []
+        self.prefs: Prefs = load_prefs()
+        self.graph_height: int = self.prefs.graph_height or max(
+            1, getattr(self.manager.config, "graph_height", 3)
+        )
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -746,10 +980,68 @@ class VramctlApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._apply_saved_theme()
         self.set_interval(self.manager.config.refresh_seconds, self._tick)
         self.action_refresh()
 
     # --- rendering ------------------------------------------------------
+
+    def _apply_saved_theme(self) -> None:
+        """Honour the saved theme, ignoring one that no longer exists.
+
+        Config supplies the default; a theme chosen in the UI overrides it,
+        being the more recent explicit choice.
+        """
+        wanted = self.prefs.theme or getattr(self.manager.config, "theme", "")
+        if wanted and wanted in self.available_themes:
+            self.theme = wanted
+
+    def rerender(self) -> None:
+        """Redraw from the last known state, e.g. after a theme or size change."""
+        palette = theme_palette(self)
+        for card in self._cards.values():
+            gpu, models, series, _, _ = card._last
+            card.set_state(
+                gpu, models, series, palette=palette, height=self.graph_height
+            )
+
+    MAX_GRAPH_HEIGHT = 8
+
+    def action_taller(self) -> None:
+        self._set_graph_height(self.graph_height + 1)
+
+    def action_shorter(self) -> None:
+        self._set_graph_height(self.graph_height - 1)
+
+    def _set_graph_height(self, height: int) -> None:
+        height = max(1, min(self.MAX_GRAPH_HEIGHT, height))
+        if height == self.graph_height:
+            return
+        self.graph_height = height
+        self.rerender()
+        self.prefs.graph_height = height
+        save_prefs(self.prefs)
+        self.notify(f"Graph height {height}", timeout=1.5)
+
+    def action_theme(self) -> None:
+        self.push_screen(ThemePicker(self.theme), self._on_theme_chosen)
+
+    def _on_theme_chosen(self, name: str | None) -> None:
+        if name is None:
+            return
+        self.theme = name
+        self.rerender()
+        self.prefs.theme = name
+        if save_prefs(self.prefs):
+            self.notify(f"Theme saved: {name}")
+        else:
+            # Worth saying out loud: the theme applies now but will not come
+            # back next time.
+            self.notify(
+                f"Theme set to {name}, but could not be saved to "
+                f"{prefs_path()}",
+                severity="warning",
+            )
 
     def _tick(self) -> None:
         if not self._busy:
@@ -808,6 +1100,8 @@ class VramctlApp(App[None]):
                             gpu,
                             state.models_on_gpu(node.name, gpu.index),
                             self.manager.series_for(node.name, gpu.index),
+                            palette=theme_palette(self),
+                            height=self.graph_height,
                         )
             return
 
@@ -834,6 +1128,8 @@ class VramctlApp(App[None]):
                     gpu,
                     state.models_on_gpu(node.name, gpu.index),
                     self.manager.series_for(node.name, gpu.index),
+                    palette=theme_palette(self),
+                    height=self.graph_height,
                 )
                 self._cards[(node.name, gpu.index)] = card
                 cards.append(card)

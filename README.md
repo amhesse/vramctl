@@ -61,6 +61,15 @@ Other flags: `--config FILE`, `--ollama-url URL`, `--strata-url URL`,
 `--gguf-dir DIR` (repeatable), `--refresh SECONDS`, and
 `--no-ollama` / `--no-llamacpp` / `--no-strata` to skip a backend.
 
+### Preferences
+
+Choices made in the UI - the theme and the graph height - are saved to
+`$XDG_STATE_HOME/vramctl/prefs.json` (`~/.local/state/vramctl/prefs.json`),
+separate from `config.json` so the app never rewrites a hand-written file.
+A `theme` or `graph_height` in `config.json` supplies the default; a choice
+made in the UI wins, being the more recent explicit one. A missing or
+corrupt preferences file falls back to defaults rather than failing to start.
+
 ### Configuration
 
 Optional JSON at `~/.config/vramctl/config.json` (or `~/.vramctl.json`).
